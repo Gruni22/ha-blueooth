@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import shutil
 import socket
 from typing import TYPE_CHECKING
 
@@ -26,6 +26,8 @@ RFCOMM_BACKLOG: int = 5
 # Same UUID the Android app uses
 HA_RFCOMM_UUID = "00001101-0000-1000-8000-00805F9B34FB"
 
+_HAS_BLUETOOTHCTL = shutil.which("bluetoothctl") is not None
+
 
 class RfcommServer:
     """Accepts RFCOMM connections and bridges them to the local HA WebSocket API."""
@@ -37,8 +39,37 @@ class RfcommServer:
         self._running = False
         self._accept_task: asyncio.Task | None = None
 
+    async def _set_discoverable(self, enabled: bool) -> None:
+        """Set the local Bluetooth adapter to discoverable/pairable via bluetoothctl."""
+        if not _HAS_BLUETOOTHCTL:
+            if enabled:
+                _LOGGER.warning(
+                    "bluetoothctl not found – cannot set adapter discoverable. "
+                    "Pair your Android device with this host manually first."
+                )
+            return
+        flag = "on" if enabled else "off"
+        commands: list[list[str]] = []
+        if enabled:
+            commands.append(["bluetoothctl", "power", "on"])
+        commands += [
+            ["bluetoothctl", "discoverable", flag],
+            ["bluetoothctl", "pairable", flag],
+        ]
+        for cmd in commands:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+            except OSError as exc:
+                _LOGGER.debug("bluetoothctl command %s failed: %s", cmd, exc)
+
     async def start(self) -> None:
-        """Bind the RFCOMM server socket and start accepting connections."""
+        """Make the adapter discoverable, then bind the RFCOMM server socket."""
+        await self._set_discoverable(True)
         try:
             sock = socket.socket(
                 socket.AF_BLUETOOTH,
@@ -59,13 +90,14 @@ class RfcommServer:
         self._accept_task = asyncio.ensure_future(self._accept_loop())
 
     async def stop(self) -> None:
-        """Stop accepting new connections and close the server socket."""
+        """Stop accepting new connections and restore adapter discoverability."""
         self._running = False
         if self._accept_task:
             self._accept_task.cancel()
         if self._server_sock:
             self._server_sock.close()
             self._server_sock = None
+        await self._set_discoverable(False)
         _LOGGER.info("HA Bluetooth API (RFCOMM) stopped")
 
     async def _accept_loop(self) -> None:
