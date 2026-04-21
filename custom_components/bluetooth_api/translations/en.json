@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Bluetooth API",
+        "description": "Connect your Home Assistant Android app via Bluetooth (no network required).",
+        "data": {
+          "rfcomm_enabled": "Enable Classic Bluetooth (RFCOMM)",
+          "rfcomm_channel": "RFCOMM channel",
+          "ble_enabled": "Enable Bluetooth Low Energy (BLE GATT)"
+        },
+        "data_description": {
+          "rfcomm_channel": "RFCOMM channel number (1–30). Use 1 unless you have a conflict."
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Only a single Bluetooth API instance is allowed."
+    }
+  }
+}

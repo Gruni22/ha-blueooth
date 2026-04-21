@@ -1,0 +1,18 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Bluetooth API",
+        "description": "Connect your mobile app to Home Assistant via Bluetooth when no network is available.",
+        "data": {
+          "rfcomm_enabled": "Enable Classic Bluetooth (RFCOMM)",
+          "rfcomm_channel": "RFCOMM channel (1–30)",
+          "ble_enabled": "Enable BLE GATT (requires bless library)"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Only one Bluetooth API instance is allowed."
+    }
+  }
+}

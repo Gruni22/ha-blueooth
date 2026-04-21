@@ -1,39 +1,46 @@
-<div align="center">
-    <picture>
-        <source media="(prefers-color-scheme: light)" srcset="https://user-images.githubusercontent.com/7659/174594540-5e29e523-396a-465b-9a6e-6cab5b15a568.svg">
-        <source media="(prefers-color-scheme: dark)" srcset="https://user-images.githubusercontent.com/7659/174594559-0b3ddaa7-e75b-4f10-9dee-b51431a9fd4c.svg">
-        <img src="https://user-images.githubusercontent.com/7659/174594540-5e29e523-396a-465b-9a6e-6cab5b15a568.svg" alt="Dependabot" width="336">
-    </picture>
-</div>
+# ha-core-changes – Bluetooth API Integration
 
-## Dependabot Demo Repository
+Diese Dateien gehören in den Fork von `home-assistant/core` und implementieren
+die serverseitige Bluetooth-Unterstützung für die HA Android App.
 
-This repo contains some projects with outdated dependencies. Fork it to try out
-Dependabot :dependabot:!
+## Fork-Workflow
 
-### Enabling Security Updates
+1. Gehe zu https://github.com/home-assistant/core und erstelle einen Fork
+2. Erstelle einen Branch `bluetooth` in deinem Fork
+3. Kopiere den Inhalt dieses Ordners in die entsprechenden Pfade deines Forks:
+   - `ha-core-changes/homeassistant/` → `homeassistant/`
+   - `ha-core-changes/tests/` → `tests/`
+4. Committe und pushe
+5. Öffne einen PR gegen `home-assistant/core:dev`
 
-- In your fork, click the **Settings** tab
-- In the left hand side navigation, click **Code security and analysis**
-- Enable **Dependabot security updates** or **Grouped security updates**
-- Dependabot will now start creating PRs for detected security vulnerabilities
-- Go into the **Security** tab and click **Dependabot** in the left hand side navigation to see what Dependabot is working on
+## Integration: `bluetooth_api`
 
-<img width="929" alt="screenshot showing Dependabot working on Security Updates" src="https://github.com/dependabot/demo/assets/886768/9295c61a-631b-4c56-9c00-ff078874f362">
+**Pfad:** `homeassistant/components/bluetooth_api/`
 
-After about 5 minutes you should see some PRs open. Merge them and the Securty Alerts will close 🎉
+### Architektur
 
-### Enabling Version Updates
+```
+Android App ←─ RFCOMM/BLE ─→ bluetooth_api ←─ ws://127.0.0.1:8123/api/websocket ─→ HA Core
+```
 
-This demo includes a `dependabot.yml` which configures [Version Updates](https://docs.github.com/github/administering-a-repository/keeping-your-dependencies-updated-automatically), but forks don't automatically start with Dependabot enabled.
+Die Integration öffnet einen RFCOMM-Socket (Classic Bluetooth) und/oder einen BLE
+GATT-Service und leitet alle Nachrichten transparent zur lokalen HA WebSocket API
+weiter. Die Android App authentifiziert sich mit ihrem Long-Lived Access Token – genau
+wie über eine normale Netzwerkverbindung.
 
-The enable Dependabot on your fork:
-- Click the **Insights** tab
-- In the left hand side navigation, click **Dependency Graph**
-- Click on the **Dependabot** tab
-- Click on the **Enable Dependabot** button
-- After a moment, refresh the page and you should see Dependabot hard at work
+### Konfiguration in HA
 
-<img width="917" alt="screenshot showing Dependabot working on Version Updates" src="https://github.com/dependabot/demo/assets/886768/4adf5727-255a-4ae1-97f7-70e94dc1134b">
+1. **Einstellungen → Geräte & Dienste → Integration hinzufügen → "Bluetooth API"**
+2. RFCOMM aktivieren (Standard) und/oder BLE aktivieren
+3. Das Android-Gerät mit dem HA-Host per Bluetooth koppeln
 
-After a few minutes, you should get some more PRs!
+### Abhängigkeiten
+
+- **RFCOMM:** Kein zusätzliches Python-Paket nötig (`socket.AF_BLUETOOTH` ist in Python 3 eingebaut)
+- **BLE GATT:** Erfordert `bless` (`pip install bless`) – optional
+
+### Tests ausführen
+
+```bash
+pytest tests/components/bluetooth_api/ -v
+```
