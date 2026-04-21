@@ -77,7 +77,7 @@ class RfcommServer:
                 socket.BTPROTO_RFCOMM,  # type: ignore[attr-defined]
             )
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("", self._channel))
+            sock.bind(("00:00:00:00:00:00", self._channel))
             sock.listen(RFCOMM_BACKLOG)
             sock.setblocking(False)
             self._server_sock = sock
