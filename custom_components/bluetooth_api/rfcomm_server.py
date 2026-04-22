@@ -27,6 +27,7 @@ RFCOMM_BACKLOG: int = 5
 HA_RFCOMM_UUID = "00001101-0000-1000-8000-00805F9B34FB"
 
 _HAS_BLUETOOTHCTL = shutil.which("bluetoothctl") is not None
+_HAS_SDPTOOL = shutil.which("sdptool") is not None
 
 
 class RfcommServer:
@@ -38,6 +39,19 @@ class RfcommServer:
         self._server_sock: socket.socket | None = None
         self._running = False
         self._accept_task: asyncio.Task | None = None
+        self._agent_proc: asyncio.subprocess.Process | None = None
+
+    async def _run_cmd(self, cmd: list[str]) -> None:
+        """Run a subprocess command, ignoring errors."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+        except OSError as exc:
+            _LOGGER.debug("Command %s failed: %s", cmd, exc)
 
     async def _set_discoverable(self, enabled: bool) -> None:
         """Set the local Bluetooth adapter to discoverable/pairable via bluetoothctl."""
@@ -49,27 +63,83 @@ class RfcommServer:
                 )
             return
         flag = "on" if enabled else "off"
-        commands: list[list[str]] = []
         if enabled:
-            commands.append(["bluetoothctl", "power", "on"])
-        commands += [
-            ["bluetoothctl", "discoverable", flag],
-            ["bluetoothctl", "pairable", flag],
-        ]
-        for cmd in commands:
+            await self._run_cmd(["bluetoothctl", "power", "on"])
+            # Disable timeout so the adapter stays discoverable indefinitely.
+            await self._run_cmd(["bluetoothctl", "discoverable-timeout", "0"])
+        await self._run_cmd(["bluetoothctl", "discoverable", flag])
+        await self._run_cmd(["bluetoothctl", "pairable", flag])
+
+    async def _register_sdp(self) -> None:
+        """Register an SPP SDP record so Android can discover the RFCOMM service."""
+        if not _HAS_SDPTOOL:
+            _LOGGER.debug("sdptool not found – skipping SDP registration")
+            return
+        await self._run_cmd(["sdptool", "add", f"--channel={self._channel}", "SP"])
+        _LOGGER.debug("Registered SDP SPP record on channel %d", self._channel)
+
+    async def _unregister_sdp(self) -> None:
+        """Remove the SPP SDP record (best-effort)."""
+        if not _HAS_SDPTOOL:
+            return
+        # sdptool del <handle> – retrieve handle first
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "sdptool", "browse", "local",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            handle: str | None = None
+            lines = stdout.decode(errors="replace").splitlines()
+            for i, line in enumerate(lines):
+                if "Serial Port" in line:
+                    for prev in lines[max(0, i - 5):i]:
+                        if "Service RecHandle:" in prev:
+                            handle = prev.split(":")[-1].strip()
+                            break
+                    break
+            if handle:
+                await self._run_cmd(["sdptool", "del", handle])
+        except OSError:
+            pass
+
+    async def _start_pairing_agent(self) -> None:
+        """Start a bluetoothctl NoInputNoOutput agent to auto-accept pairing requests."""
+        if not _HAS_BLUETOOTHCTL:
+            return
+        try:
+            self._agent_proc = await asyncio.create_subprocess_exec(
+                "bluetoothctl",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            assert self._agent_proc.stdin  # noqa: S101
+            self._agent_proc.stdin.write(b"agent NoInputNoOutput\n")
+            self._agent_proc.stdin.write(b"default-agent\n")
+            await self._agent_proc.stdin.drain()
+            _LOGGER.debug("Bluetooth pairing agent started (NoInputNoOutput)")
+        except OSError as exc:
+            _LOGGER.debug("Could not start pairing agent: %s", exc)
+
+    async def _stop_pairing_agent(self) -> None:
+        """Terminate the bluetoothctl pairing agent subprocess."""
+        if self._agent_proc and self._agent_proc.returncode is None:
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await proc.wait()
-            except OSError as exc:
-                _LOGGER.debug("bluetoothctl command %s failed: %s", cmd, exc)
+                assert self._agent_proc.stdin  # noqa: S101
+                self._agent_proc.stdin.write(b"quit\n")
+                await self._agent_proc.stdin.drain()
+            except OSError:
+                pass
+            self._agent_proc.terminate()
+            self._agent_proc = None
 
     async def start(self) -> None:
-        """Make the adapter discoverable, then bind the RFCOMM server socket."""
+        """Make the adapter discoverable, register SDP, then bind the RFCOMM socket."""
         await self._set_discoverable(True)
+        await self._start_pairing_agent()
+        await self._register_sdp()
         try:
             sock = socket.socket(
                 socket.AF_BLUETOOTH,
@@ -97,6 +167,8 @@ class RfcommServer:
         if self._server_sock:
             self._server_sock.close()
             self._server_sock = None
+        await self._unregister_sdp()
+        await self._stop_pairing_agent()
         await self._set_discoverable(False)
         _LOGGER.info("HA Bluetooth API (RFCOMM) stopped")
 

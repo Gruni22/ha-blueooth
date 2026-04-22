@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 from typing import TYPE_CHECKING
 
 import aiohttp
-from bleak import BleakError  # type: ignore[import]
 
 try:
+    from bleak import BleakError  # type: ignore[import]
     from bless import BlessServer, BlessGATTCharacteristic  # type: ignore[import]
     HAS_BLESS = True
 except ImportError:
     HAS_BLESS = False
+    BleakError = Exception  # type: ignore[assignment,misc]
 
 from homeassistant.core import HomeAssistant
 
@@ -28,6 +30,23 @@ if TYPE_CHECKING:
     pass
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _find_hci_adapter() -> str:
+    """Return the first available hci adapter name, e.g. 'hci0'."""
+    try:
+        result = subprocess.run(
+            ["hciconfig"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if line and not line.startswith(" ") and ":" in line:
+                return line.split(":")[0].strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return "hci0"
 
 # Custom Service / Characteristic UUIDs – must match the Android app constants.
 HA_BLE_SERVICE_UUID = "a10d4b1c-bf45-4c2a-9c32-4a8f7e3d1234"
@@ -58,7 +77,9 @@ class BleGattServer:
             )
             return
 
-        self._server = BlessServer(name="Home Assistant")
+        adapter = _find_hci_adapter()
+        _LOGGER.debug("BLE GATT server using adapter: %s", adapter)
+        self._server = BlessServer(name="Home Assistant", adapter=adapter)
         await self._server.add_new_service(HA_BLE_SERVICE_UUID)
 
         # TX characteristic – notify (HA → Android)
