@@ -30,6 +30,24 @@ _HAS_BLUETOOTHCTL = shutil.which("bluetoothctl") is not None
 _HAS_SDPTOOL = shutil.which("sdptool") is not None
 
 
+def _async_create_notification(hass: HomeAssistant, message: str) -> None:
+    """Create a persistent HA notification via the service bus."""
+    try:
+        hass.async_create_task(
+            hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "message": message,
+                    "title": "Bluetooth Pairing",
+                    "notification_id": "bluetooth_api_pairing",
+                },
+            )
+        )
+    except Exception:  # noqa: BLE001
+        _LOGGER.debug("Could not create pairing notification")
+
+
 class RfcommServer:
     """Accepts RFCOMM connections and bridges them to the local HA WebSocket API."""
 
@@ -156,14 +174,14 @@ class RfcommServer:
                     "Bluetooth pairing – confirm passkey %s on your Android device",
                     passkey,
                 )
-                self._hass.components.persistent_notification.async_create(
-                    f"Bluetooth pairing in progress.\n\n"
-                    f"Confirm passkey **{passkey}** on your Android device.",
-                    title="Bluetooth Pairing",
-                    notification_id="bluetooth_api_pairing",
-                )
+                # Confirm FIRST – nothing must prevent this from running.
                 stdin.write(b"yes\n")
                 await stdin.drain()
+                _async_create_notification(
+                    self._hass,
+                    f"Bluetooth pairing in progress.\n\n"
+                    f"Confirm passkey **{passkey}** on your Android device.",
+                )
 
             elif "Request PIN" in line or "Request Passkey" in line:
                 # Legacy pairing fallback – use a fixed PIN logged for the user.
@@ -172,13 +190,13 @@ class RfcommServer:
                     "Bluetooth legacy pairing – enter PIN %s on your Android device",
                     pin.decode(),
                 )
-                self._hass.components.persistent_notification.async_create(
-                    f"Bluetooth legacy pairing.\n\nEnter PIN **{pin.decode()}** on your Android device.",
-                    title="Bluetooth Pairing",
-                    notification_id="bluetooth_api_pairing",
-                )
+                # Confirm FIRST – nothing must prevent this from running.
                 stdin.write(pin + b"\n")
                 await stdin.drain()
+                _async_create_notification(
+                    self._hass,
+                    f"Bluetooth legacy pairing.\n\nEnter PIN **{pin.decode()}** on your Android device.",
+                )
 
     async def _stop_pairing_agent(self) -> None:
         """Terminate the bluetoothctl pairing agent subprocess."""
