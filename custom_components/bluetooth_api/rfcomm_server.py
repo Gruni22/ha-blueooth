@@ -105,23 +105,77 @@ class RfcommServer:
             pass
 
     async def _start_pairing_agent(self) -> None:
-        """Start a bluetoothctl NoInputNoOutput agent to auto-accept pairing requests."""
+        """Start a bluetoothctl DisplayYesNo agent.
+
+        Uses Numeric Comparison: Android shows a 6-digit passkey that the user
+        confirms on Android; the Pi auto-confirms and logs the passkey + creates
+        a HA persistent notification so the user can verify it.
+        """
         if not _HAS_BLUETOOTHCTL:
             return
         try:
             self._agent_proc = await asyncio.create_subprocess_exec(
                 "bluetoothctl",
                 stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
             assert self._agent_proc.stdin  # noqa: S101
-            self._agent_proc.stdin.write(b"agent NoInputNoOutput\n")
+            self._agent_proc.stdin.write(b"agent DisplayYesNo\n")
             self._agent_proc.stdin.write(b"default-agent\n")
             await self._agent_proc.stdin.drain()
-            _LOGGER.debug("Bluetooth pairing agent started (NoInputNoOutput)")
+            asyncio.ensure_future(self._agent_read_loop())
+            _LOGGER.debug("Bluetooth pairing agent started (DisplayYesNo)")
         except OSError as exc:
             _LOGGER.debug("Could not start pairing agent: %s", exc)
+
+    async def _agent_read_loop(self) -> None:
+        """Read bluetoothctl output and handle pairing requests automatically."""
+        if not self._agent_proc or not self._agent_proc.stdout:
+            return
+        async for raw in self._agent_proc.stdout:
+            line = raw.decode(errors="replace").strip()
+            if not line:
+                continue
+            _LOGGER.debug("bluetoothctl agent: %s", line)
+
+            stdin = self._agent_proc.stdin
+            if not stdin:
+                continue
+
+            if "Confirm passkey" in line:
+                # Format: "[agent] Confirm passkey 123456 (yes/no):"
+                parts = line.split()
+                passkey = next(
+                    (p for p in parts if p.isdigit() and len(p) == 6), "??????"
+                )
+                _LOGGER.info(
+                    "Bluetooth pairing – confirm passkey %s on your Android device",
+                    passkey,
+                )
+                self._hass.components.persistent_notification.async_create(
+                    f"Bluetooth pairing in progress.\n\n"
+                    f"Confirm passkey **{passkey}** on your Android device.",
+                    title="Bluetooth Pairing",
+                    notification_id="bluetooth_api_pairing",
+                )
+                stdin.write(b"yes\n")
+                await stdin.drain()
+
+            elif "Request PIN" in line or "Request Passkey" in line:
+                # Legacy pairing fallback – use a fixed PIN logged for the user.
+                pin = b"000000"
+                _LOGGER.info(
+                    "Bluetooth legacy pairing – enter PIN %s on your Android device",
+                    pin.decode(),
+                )
+                self._hass.components.persistent_notification.async_create(
+                    f"Bluetooth legacy pairing.\n\nEnter PIN **{pin.decode()}** on your Android device.",
+                    title="Bluetooth Pairing",
+                    notification_id="bluetooth_api_pairing",
+                )
+                stdin.write(pin + b"\n")
+                await stdin.drain()
 
     async def _stop_pairing_agent(self) -> None:
         """Terminate the bluetoothctl pairing agent subprocess."""
