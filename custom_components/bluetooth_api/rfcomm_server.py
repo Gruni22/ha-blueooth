@@ -131,18 +131,19 @@ class RfcommServer:
 
     async def _agent_read_loop(self) -> None:
         """Read bluetoothctl output and handle pairing requests automatically."""
-        if not self._agent_proc or not self._agent_proc.stdout:
+        proc = self._agent_proc
+        if not proc or not proc.stdout or not proc.stdin:
             return
-        async for raw in self._agent_proc.stdout:
+        stdout = proc.stdout
+        stdin = proc.stdin
+        async for raw in stdout:
+            if self._agent_proc is None:
+                break
             line = raw.decode(errors="replace").strip()
             if not line:
                 continue
             # Ignore high-frequency BLE scan noise (RSSI updates, device changes).
             if "[CHG] Device" in line or "[NEW] Device" in line or "[DEL] Device" in line:
-                continue
-
-            stdin = self._agent_proc.stdin
-            if not stdin:
                 continue
 
             if "Confirm passkey" in line:
