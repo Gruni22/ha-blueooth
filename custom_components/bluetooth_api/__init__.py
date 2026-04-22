@@ -48,8 +48,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             servers.append(rfcomm)
             _LOGGER.info("Bluetooth API RFCOMM server started on channel %d", rfcomm_channel)
         except OSError as exc:
-            _LOGGER.error("Failed to start RFCOMM server: %s", exc)
-            return False
+            _LOGGER.error(
+                "Failed to start RFCOMM server on channel %d: %s – "
+                "check that no other process is using this channel and that "
+                "Bluetooth is available on this host",
+                rfcomm_channel,
+                exc,
+            )
 
     if ble_enabled:
         try:
@@ -80,9 +85,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Stop all BT servers and unload the config entry."""
-    servers = hass.data[DOMAIN].pop(entry.entry_id, [])
+    servers = hass.data.get(DOMAIN, {}).pop(entry.entry_id, [])
     for server in servers:
-        await server.stop()
+        try:
+            await server.stop()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("Error stopping BT server during unload: %s", exc)
     return True
 
 

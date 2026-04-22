@@ -3,10 +3,9 @@
   "name": "Bluetooth API",
   "codeowners": ["@Gruni22"],
   "config_flow": true,
-  "dependencies": ["auth", "bluetooth"],
+  "dependencies": ["auth", "http"],
   "documentation": "https://github.com/Gruni22/ha-bluetooth",
   "iot_class": "local_push",
   "quality_scale": "internal",
-  "version": "0.1.4",
-  "requirements": ["bless>=0.2.0"]
+  "version": "0.1.5"
 }
