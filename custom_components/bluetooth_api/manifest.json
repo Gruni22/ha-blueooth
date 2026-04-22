@@ -4,7 +4,7 @@
   "codeowners": ["@Gruni22"],
   "config_flow": true,
   "dependencies": ["auth", "http"],
-  "documentation": "https://github.com/Gruni22/ha-bluetooth",
+  "documentation": "https://github.com/Gruni22/ha-blueooth",
   "iot_class": "local_push",
   "quality_scale": "internal",
   "version": "0.1.5"
