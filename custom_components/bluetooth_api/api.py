@@ -43,11 +43,18 @@ class BluetoothApiConfigView(HomeAssistantView):
             transport = "ble"
             channel = None
 
+        servers = hass.data.get(DOMAIN, {}).get(entry.entry_id, [])
+        rfcomm_running = any(
+            getattr(s, "_running", False) and getattr(s, "_server_sock", None) is not None
+            for s in servers
+        )
+
         return self.json(
             {
                 "adapter_address": adapter_address,
                 "transport": transport,
                 "channel": channel,
+                "rfcomm_running": rfcomm_running,
             }
         )
 
