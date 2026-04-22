@@ -143,13 +143,22 @@ class BleGattServer:
         """Split *data* into BLE chunks and send as TX notifications."""
         if not self._server:
             return
+        _LOGGER.debug("BLE TX: sending %d bytes in chunks", len(data))
         offset = 0
         while offset < len(data):
             end = min(offset + BLE_MAX_PAYLOAD, len(data))
             flag = BLE_CHUNK_FINAL if end == len(data) else BLE_CHUNK_CONTINUES
             chunk = bytes([flag]) + data[offset:end]
             try:
-                await self._server.update_value(HA_BLE_SERVICE_UUID, HA_BLE_TX_UUID, chunk)
+                # bless API: set value on characteristic, then notify subscribers
+                char = self._server.get_characteristic(HA_BLE_TX_UUID)
+                if char is not None:
+                    char.value = bytearray(chunk)
+                await self._server.update_value(HA_BLE_SERVICE_UUID, HA_BLE_TX_UUID)
+                _LOGGER.debug(
+                    "BLE TX chunk: offset=%d end=%d flag=%s",
+                    offset, end, "FINAL" if flag == BLE_CHUNK_FINAL else "CONTINUES",
+                )
             except BleakError as exc:
                 _LOGGER.debug("BLE send error: %s", exc)
                 break
@@ -168,8 +177,13 @@ class BleGattServer:
             return
         self._chunk_buffer.append(data)
         flag = data[0]
+        _LOGGER.debug(
+            "BLE RX chunk: %d bytes, flag=%s, buffer_len=%d",
+            len(data), "FINAL" if flag == BLE_CHUNK_FINAL else "CONTINUES", len(self._chunk_buffer),
+        )
         if flag == BLE_CHUNK_FINAL:
             frame = decode_ble_chunks(self._chunk_buffer)
+            _LOGGER.debug("BLE RX frame: %d bytes → WS: %.200s", len(frame), frame.decode(errors="replace"))
             self._chunk_buffer.clear()
             asyncio.ensure_future(self._forward_to_ws(frame))
 

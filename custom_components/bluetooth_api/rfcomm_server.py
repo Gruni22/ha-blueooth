@@ -249,10 +249,12 @@ class RfcommServer:
         reader, writer = await asyncio.open_connection(sock=client_sock)
 
         ws_url = f"ws://127.0.0.1:{self._hass.config.api.port}/api/websocket"  # type: ignore[union-attr]
+        _LOGGER.info("RFCOMM: bridging client to %s", ws_url)
 
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(ws_url) as ws:
+                    _LOGGER.debug("RFCOMM: local WS connection established, starting bridge")
                     await asyncio.gather(
                         self._bt_to_ws(reader, ws),
                         self._ws_to_bt(ws, writer),
@@ -260,6 +262,7 @@ class RfcommServer:
         except Exception as exc:  # noqa: BLE001
             _LOGGER.debug("RFCOMM client session ended: %s", exc)
         finally:
+            _LOGGER.info("RFCOMM: client disconnected")
             writer.close()
             try:
                 await writer.wait_closed()
@@ -275,9 +278,10 @@ class RfcommServer:
         try:
             while True:
                 frame = await rfcomm_read_frame(reader)
+                _LOGGER.debug("RFCOMM RX (%d bytes) → WS: %.200s", len(frame), frame.decode(errors="replace"))
                 await ws.send_str(frame.decode())
         except asyncio.IncompleteReadError:
-            pass  # BT client disconnected
+            _LOGGER.debug("RFCOMM: client disconnected (IncompleteReadError)")
 
     @staticmethod
     async def _ws_to_bt(
@@ -287,6 +291,8 @@ class RfcommServer:
         """Forward local HA WebSocket messages → BT client."""
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
+                _LOGGER.debug("WS → RFCOMM TX (%d bytes): %.200s", len(msg.data), msg.data)
                 await rfcomm_write_frame(writer, msg.data.encode())
             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                _LOGGER.debug("RFCOMM WS closed: type=%s", msg.type)
                 break
