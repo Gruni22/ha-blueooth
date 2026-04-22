@@ -5,26 +5,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import pathlib
-from typing import TYPE_CHECKING
 
 from aiohttp import web
 
 from homeassistant.components.http import HomeAssistantView
+from homeassistant.core import HomeAssistant
 
-from .const import CONF_BLE_ENABLED, CONF_RFCOMM_CHANNEL, CONF_RFCOMM_ENABLED, DOMAIN
-
-if TYPE_CHECKING:
-    from homeassistant.core import HomeAssistant
+from .const import CONF_RFCOMM_CHANNEL, CONF_RFCOMM_ENABLED, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class BluetoothApiConfigView(HomeAssistantView):
-    """GET /api/bluetooth_api/config – returns adapter address and active transport.
-
-    The Android app calls this (while still on WiFi) to auto-discover the BT
-    address and transport type so the user never has to enter them manually.
-    """
+    """GET /api/bluetooth_api/config – returns adapter address and active transport."""
 
     url = "/api/bluetooth_api/config"
     name = "api:bluetooth_api:config"
@@ -38,7 +31,10 @@ class BluetoothApiConfigView(HomeAssistantView):
             return self.json_message("bluetooth_api is not configured", status_code=404)
 
         entry = entries[0]
-        adapter_address = await _get_adapter_address()
+        # Run blocking sysfs/subprocess I/O in a thread pool executor.
+        adapter_address = await hass.async_add_executor_job(_read_adapter_address_sync)
+        if adapter_address is None:
+            adapter_address = await _read_adapter_address_hciconfig()
 
         if entry.data.get(CONF_RFCOMM_ENABLED, True):
             transport = "rfcomm"
@@ -56,9 +52,8 @@ class BluetoothApiConfigView(HomeAssistantView):
         )
 
 
-async def _get_adapter_address() -> str | None:
-    """Return the MAC address of the first available Bluetooth HCI adapter."""
-    # Fast path: sysfs (no subprocess, works on Raspberry Pi OS / HA OS)
+def _read_adapter_address_sync() -> str | None:
+    """Read BT adapter MAC from sysfs (blocking – run in executor)."""
     try:
         for hci in sorted(pathlib.Path("/sys/class/bluetooth").glob("hci*")):
             addr_file = hci / "address"
@@ -67,8 +62,11 @@ async def _get_adapter_address() -> str | None:
                 return addr
     except OSError:
         pass
+    return None
 
-    # Fallback: hciconfig
+
+async def _read_adapter_address_hciconfig() -> str | None:
+    """Fallback: parse hciconfig output (async subprocess – non-blocking)."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "hciconfig",
@@ -83,6 +81,5 @@ async def _get_adapter_address() -> str | None:
                     return addr
     except OSError:
         pass
-
     _LOGGER.warning("Could not determine Bluetooth adapter address")
     return None

@@ -11,11 +11,18 @@ import aiohttp
 
 try:
     from bleak import BleakError  # type: ignore[import]
-    from bless import BlessServer, BlessGATTCharacteristic  # type: ignore[import]
+    from bless import (  # type: ignore[import]
+        BlessServer,
+        BlessGATTCharacteristic,
+        GATTAttributePermissions,
+        GATTCharacteristicProperties,
+    )
     HAS_BLESS = True
 except ImportError:
     HAS_BLESS = False
     BleakError = Exception  # type: ignore[assignment,misc]
+    GATTCharacteristicProperties = None  # type: ignore[assignment]
+    GATTAttributePermissions = None  # type: ignore[assignment]
 
 from homeassistant.core import HomeAssistant
 
@@ -86,17 +93,17 @@ class BleGattServer:
         await self._server.add_new_characteristic(
             HA_BLE_SERVICE_UUID,
             HA_BLE_TX_UUID,
-            {"notify"},
+            GATTCharacteristicProperties.notify,
             None,
-            0,
+            GATTAttributePermissions.readable,
         )
         # RX characteristic – write without response (Android → HA)
         await self._server.add_new_characteristic(
             HA_BLE_SERVICE_UUID,
             HA_BLE_RX_UUID,
-            {"write-without-response"},
+            GATTCharacteristicProperties.write_without_response,
             None,
-            0,
+            GATTAttributePermissions.writeable,
         )
         self._server.write_request_func = self._on_write
         await self._server.start()
