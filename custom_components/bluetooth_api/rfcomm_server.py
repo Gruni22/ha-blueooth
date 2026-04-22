@@ -105,11 +105,11 @@ class RfcommServer:
             pass
 
     async def _start_pairing_agent(self) -> None:
-        """Register a NoInputNoOutput Bluetooth agent via bluetoothctl.
+        """Start a bluetoothctl DisplayYesNo agent.
 
-        NoInputNoOutput means the Pi auto-accepts any pairing request without
-        showing or confirming a passkey.  Security is provided by the HA
-        Long-Lived Access Token that every client must present after connecting.
+        Uses Numeric Comparison: Android shows a 6-digit passkey that the user
+        confirms on Android; the Pi auto-confirms and logs the passkey + creates
+        a HA persistent notification so the user can verify it.
         """
         if not _HAS_BLUETOOTHCTL:
             return
@@ -117,22 +117,68 @@ class RfcommServer:
             self._agent_proc = await asyncio.create_subprocess_exec(
                 "bluetoothctl",
                 stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
             assert self._agent_proc.stdin  # noqa: S101
-            self._agent_proc.stdin.write(b"agent NoInputNoOutput\n")
+            self._agent_proc.stdin.write(b"agent DisplayYesNo\n")
             self._agent_proc.stdin.write(b"default-agent\n")
             await self._agent_proc.stdin.drain()
-            _LOGGER.info(
-                "Bluetooth pairing agent started (NoInputNoOutput – "
-                "auto-accepts all pairing requests)"
-            )
+            asyncio.ensure_future(self._agent_read_loop())
+            _LOGGER.debug("Bluetooth pairing agent started (DisplayYesNo)")
         except OSError as exc:
             _LOGGER.debug("Could not start pairing agent: %s", exc)
 
     async def _agent_read_loop(self) -> None:
-        """No-op – stdout is discarded for the NoInputNoOutput agent."""
+        """Read bluetoothctl output and handle pairing requests automatically."""
+        proc = self._agent_proc
+        if not proc or not proc.stdout or not proc.stdin:
+            return
+        stdout = proc.stdout
+        stdin = proc.stdin
+        async for raw in stdout:
+            if self._agent_proc is None:
+                break
+            line = raw.decode(errors="replace").strip()
+            if not line:
+                continue
+            # Ignore high-frequency BLE scan noise (RSSI updates, device changes).
+            if "[CHG] Device" in line or "[NEW] Device" in line or "[DEL] Device" in line:
+                continue
+
+            if "Confirm passkey" in line:
+                # Format: "[agent] Confirm passkey 123456 (yes/no):"
+                parts = line.split()
+                passkey = next(
+                    (p for p in parts if p.isdigit() and len(p) == 6), "??????"
+                )
+                _LOGGER.info(
+                    "Bluetooth pairing – confirm passkey %s on your Android device",
+                    passkey,
+                )
+                self._hass.components.persistent_notification.async_create(
+                    f"Bluetooth pairing in progress.\n\n"
+                    f"Confirm passkey **{passkey}** on your Android device.",
+                    title="Bluetooth Pairing",
+                    notification_id="bluetooth_api_pairing",
+                )
+                stdin.write(b"yes\n")
+                await stdin.drain()
+
+            elif "Request PIN" in line or "Request Passkey" in line:
+                # Legacy pairing fallback – use a fixed PIN logged for the user.
+                pin = b"000000"
+                _LOGGER.info(
+                    "Bluetooth legacy pairing – enter PIN %s on your Android device",
+                    pin.decode(),
+                )
+                self._hass.components.persistent_notification.async_create(
+                    f"Bluetooth legacy pairing.\n\nEnter PIN **{pin.decode()}** on your Android device.",
+                    title="Bluetooth Pairing",
+                    notification_id="bluetooth_api_pairing",
+                )
+                stdin.write(pin + b"\n")
+                await stdin.drain()
 
     async def _stop_pairing_agent(self) -> None:
         """Terminate the bluetoothctl pairing agent subprocess."""
