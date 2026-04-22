@@ -22,6 +22,7 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
+from .api import BluetoothApiConfigView
 from .const import CONF_BLE_ENABLED, CONF_RFCOMM_CHANNEL, CONF_RFCOMM_ENABLED, DOMAIN
 from .rfcomm_server import RfcommServer
 
@@ -67,6 +68,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.error("Failed to start BLE GATT server: %s", exc)
 
     hass.data[DOMAIN][entry.entry_id] = servers
+
+    # Register REST endpoint once (guard survives reloads).
+    if not hass.data[DOMAIN].get("view_registered"):
+        hass.http.register_view(BluetoothApiConfigView())
+        hass.data[DOMAIN]["view_registered"] = True
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True

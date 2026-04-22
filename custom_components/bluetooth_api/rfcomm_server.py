@@ -137,7 +137,9 @@ class RfcommServer:
             line = raw.decode(errors="replace").strip()
             if not line:
                 continue
-            _LOGGER.debug("bluetoothctl agent: %s", line)
+            # Ignore high-frequency BLE scan noise (RSSI updates, device changes).
+            if "[CHG] Device" in line or "[NEW] Device" in line or "[DEL] Device" in line:
+                continue
 
             stdin = self._agent_proc.stdin
             if not stdin:
