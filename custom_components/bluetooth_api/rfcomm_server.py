@@ -5,7 +5,10 @@ to register the SPP service record so Android can discover and connect via SDP.
 Falls back to sdptool + raw socket if D-Bus profile registration fails.
 """
 
-from __future__ import annotations
+# NOTE: do NOT add "from __future__ import annotations" here.
+# dbus_fast reads fn.__annotations__ directly; PEP-563 stringification breaks
+# the D-Bus type codes ("o", "h", "a{sv}") by double-quoting them, and
+# converts "-> None" return annotations to NoneType which parse_annotation rejects.
 
 import asyncio
 import logging
@@ -173,14 +176,15 @@ class RfcommServer:
                 super().__init__("org.bluez.Profile1")
 
             @dbus_method()
-            def Release(self) -> None:
+            def Release(self):  # no return annotation — dbus_fast rejects NoneType
                 _LOGGER.debug("SPP Profile: BlueZ released our profile")
 
             @dbus_method()
-            def NewConnection(self, device: "o", fd: "h", fd_properties: "a{sv}") -> None:  # type: ignore[override]
+            def NewConnection(self, device: "o", fd: "h", fd_properties: "a{sv}"):
                 _LOGGER.info("SPP: new RFCOMM connection from %s", device)
                 try:
-                    # fd is the file descriptor passed via SCM_RIGHTS (already dup'd by dbus_fast)
+                    # dbus_fast extracts the actual FD from SCM_RIGHTS ancillary data
+                    # and passes it as an integer; dup() before wrapping.
                     duped = os.dup(fd)
                     client_sock = socket.socket(
                         socket.AF_BLUETOOTH,
@@ -193,7 +197,7 @@ class RfcommServer:
                     _LOGGER.error("SPP: failed to wrap connection fd: %s", exc2)
 
             @dbus_method()
-            def RequestDisconnection(self, device: "o") -> None:  # type: ignore[override]
+            def RequestDisconnection(self, device: "o"):
                 _LOGGER.debug("SPP Profile: disconnect request from %s", device)
 
         profile = _SppProfileInterface()
