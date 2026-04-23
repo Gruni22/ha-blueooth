@@ -133,11 +133,14 @@ class BleGattServer:
         """Forward HA WebSocket messages → BLE TX notifications."""
         if not self._ws or not self._server:
             return
-        async for msg in self._ws:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                await self._send_ble_frame(msg.data.encode())
-            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                break
+        try:
+            async for msg in self._ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    await self._send_ble_frame(msg.data.encode())
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("BLE WS read loop ended: %s", exc)
 
     async def _send_ble_frame(self, data: bytes) -> None:
         """Split *data* into BLE chunks and send as TX notifications."""
@@ -154,12 +157,12 @@ class BleGattServer:
                 char = self._server.get_characteristic(HA_BLE_TX_UUID)
                 if char is not None:
                     char.value = bytearray(chunk)
-                await self._server.update_value(HA_BLE_SERVICE_UUID, HA_BLE_TX_UUID)
+                self._server.update_value(HA_BLE_SERVICE_UUID, HA_BLE_TX_UUID)
                 _LOGGER.debug(
                     "BLE TX chunk: offset=%d end=%d flag=%s",
                     offset, end, "FINAL" if flag == BLE_CHUNK_FINAL else "CONTINUES",
                 )
-            except BleakError as exc:
+            except Exception as exc:  # noqa: BLE001
                 _LOGGER.debug("BLE send error: %s", exc)
                 break
             offset = end

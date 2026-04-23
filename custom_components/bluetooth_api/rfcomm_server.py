@@ -164,11 +164,18 @@ class RfcommServer:
             if "[CHG] Device" in line or "[NEW] Device" in line or "[DEL] Device" in line:
                 continue
 
-            if "Confirm passkey" in line:
+            _LOGGER.debug("bluetoothctl: %s", line)
+
+            lower_line = line.lower()
+            if (
+                "confirm passkey" in lower_line
+                or "confirm value" in lower_line
+                or ("authorize" in lower_line and "yes/no" in lower_line)
+            ):
                 # Format: "[agent] Confirm passkey 123456 (yes/no):"
                 parts = line.split()
                 passkey = next(
-                    (p for p in parts if p.isdigit() and len(p) == 6), "??????"
+                    (p for p in parts if p.isdigit() and len(p) in (4, 6)), "??????"
                 )
                 _LOGGER.info(
                     "Bluetooth pairing – confirm passkey %s on your Android device",
@@ -183,7 +190,7 @@ class RfcommServer:
                     f"Confirm passkey **{passkey}** on your Android device.",
                 )
 
-            elif "Request PIN" in line or "Request Passkey" in line:
+            elif "request pin" in lower_line or "request passkey" in lower_line:
                 # Legacy pairing fallback – use a fixed PIN logged for the user.
                 pin = b"000000"
                 _LOGGER.info(
