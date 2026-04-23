@@ -45,7 +45,10 @@ class BluetoothApiConfigView(HomeAssistantView):
 
         servers = hass.data.get(DOMAIN, {}).get(entry.entry_id, [])
         rfcomm_running = any(
-            getattr(s, "_running", False) and getattr(s, "_server_sock", None) is not None
+            getattr(s, "_running", False) and (
+                getattr(s, "_server_sock", None) is not None   # socket mode
+                or getattr(s, "_profile_mode", False)           # D-Bus profile mode
+            )
             for s in servers
         )
 
