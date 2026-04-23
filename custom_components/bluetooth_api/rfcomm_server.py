@@ -176,15 +176,14 @@ class RfcommServer:
                 super().__init__("org.bluez.Profile1")
 
             @dbus_method()
-            def Release(self):  # no return annotation — dbus_fast rejects NoneType
+            def Release(self) -> "":  # '' = D-Bus void; dbus_fast requires a string annotation
                 _LOGGER.debug("SPP Profile: BlueZ released our profile")
 
             @dbus_method()
-            def NewConnection(self, device: "o", fd: "h", fd_properties: "a{sv}"):
+            def NewConnection(self, device: "o", fd: "h", fd_properties: "a{sv}") -> "":
                 _LOGGER.info("SPP: new RFCOMM connection from %s", device)
                 try:
-                    # dbus_fast extracts the actual FD from SCM_RIGHTS ancillary data
-                    # and passes it as an integer; dup() before wrapping.
+                    # dbus_fast extracts the actual FD from SCM_RIGHTS ancillary data.
                     duped = os.dup(fd)
                     client_sock = socket.socket(
                         socket.AF_BLUETOOTH,
@@ -197,7 +196,7 @@ class RfcommServer:
                     _LOGGER.error("SPP: failed to wrap connection fd: %s", exc2)
 
             @dbus_method()
-            def RequestDisconnection(self, device: "o"):
+            def RequestDisconnection(self, device: "o") -> "":
                 _LOGGER.debug("SPP Profile: disconnect request from %s", device)
 
         profile = _SppProfileInterface()
