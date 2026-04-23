@@ -401,13 +401,19 @@ class RfcommServer:
             return
         stdout = proc.stdout
         stdin = proc.stdin
+        import re
+        _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
         async for raw in stdout:
             if self._agent_proc is None:
                 break
-            line = raw.decode(errors="replace").strip()
+            line = _ANSI_RE.sub("", raw.decode(errors="replace")).strip()
             if not line:
                 continue
-            if "[CHG] Device" in line or "[NEW] Device" in line or "[DEL] Device" in line:
+            # Skip high-frequency BLE advertisement chatter — CHG/NEW/DEL Device lines
+            # fire dozens of times per second and would flood the HA log buffer.
+            if ("CHG] Device" in line or "NEW] Device" in line or "DEL] Device" in line
+                    or "RSSI" in line or "ManufacturerData" in line):
                 continue
 
             _LOGGER.debug("bluetoothctl: %s", line)
