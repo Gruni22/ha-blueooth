@@ -3,6 +3,11 @@
 Uses the BlueZ ProfileManager1 D-Bus API (modern BlueZ ≥ 5.43, no --compat needed)
 to register the SPP service record so Android can discover and connect via SDP.
 Falls back to sdptool + raw socket if D-Bus profile registration fails.
+
+Also provides RfcommTcpTunnel (channel 3): a raw TCP-over-RFCOMM bridge so that
+the Android WebView can reach HA's HTTP/WebSocket server without WiFi.  Android
+connects directly to channel 3 (no SDP lookup) and all bytes are relayed to
+localhost:8123.  No framing or protocol knowledge is needed on this channel.
 """
 
 # NOTE: do NOT add "from __future__ import annotations" here.
@@ -509,16 +514,155 @@ class RfcommServer:
         except asyncio.IncompleteReadError:
             _LOGGER.debug("RFCOMM: client disconnected (IncompleteReadError)")
 
-    @staticmethod
     async def _ws_to_bt(
+        self,
         ws: aiohttp.ClientWebSocketResponse,
         writer: asyncio.StreamWriter,
     ) -> None:
         """Forward local HA WebSocket messages → BT client."""
+        import json as _json
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
-                _LOGGER.debug("WS → RFCOMM TX (%d bytes): %.200s", len(msg.data), msg.data)
-                await rfcomm_write_frame(writer, msg.data.encode())
+                data_str = msg.data
+                # Inject ha_url into auth_required so BT-only clients can onboard without WiFi.
+                try:
+                    data = _json.loads(data_str)
+                    if data.get("type") == "auth_required":
+                        try:
+                            api = self._hass.config.api
+                            if api is not None:
+                                scheme = "https" if getattr(api, "use_ssl", False) else "http"
+                                local_ip = getattr(api, "local_ip", "")
+                                port = getattr(api, "port", 8123)
+                                if local_ip and local_ip not in ("0.0.0.0", ""):
+                                    data["ha_url"] = f"{scheme}://{local_ip}:{port}"
+                                    data_str = _json.dumps(data)
+                        except Exception:  # noqa: BLE001
+                            pass
+                except (_json.JSONDecodeError, AttributeError):
+                    pass
+                _LOGGER.debug("WS → RFCOMM TX (%d bytes): %.200s", len(data_str), data_str)
+                await rfcomm_write_frame(writer, data_str.encode())
             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                 _LOGGER.debug("RFCOMM WS closed: type=%s", msg.type)
                 break
+
+
+# ---------------------------------------------------------------------------
+# TCP tunnel (channel 3) – raw relay for WebView HTTP + WebSocket
+# ---------------------------------------------------------------------------
+
+#: RFCOMM channel the TCP tunnel listens on.  Android connects directly by
+#: channel number (no SDP lookup), so this value must match HA_TCP_TUNNEL_CHANNEL
+#: in the Android BluetoothTcpProxy class.
+TCP_TUNNEL_CHANNEL: int = 3
+TCP_TUNNEL_BACKLOG: int = 10
+
+
+class RfcommTcpTunnel:
+    """Raw TCP-over-RFCOMM bridge: pipes RFCOMM connections to localhost:8123.
+
+    Each RFCOMM client gets its own TCP connection to the local HA server.  No
+    framing or protocol knowledge is applied – bytes flow transparently in both
+    directions.  This allows the Android WebView to load the HA frontend and
+    maintain its WebSocket connection via Bluetooth when WiFi is unavailable.
+    """
+
+    def __init__(self, hass: HomeAssistant, channel: int = TCP_TUNNEL_CHANNEL) -> None:
+        self._hass = hass
+        self._channel = channel
+        self._server_sock: socket.socket | None = None
+        self._accept_task: asyncio.Task | None = None
+        self._running = False
+
+    async def start(self) -> None:
+        """Bind RFCOMM socket on the tunnel channel and start accepting."""
+        try:
+            sock = socket.socket(
+                socket.AF_BLUETOOTH,
+                socket.SOCK_STREAM,
+                socket.BTPROTO_RFCOMM,  # type: ignore[attr-defined]
+            )
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("00:00:00:00:00:00", self._channel))
+            sock.listen(TCP_TUNNEL_BACKLOG)
+            sock.setblocking(False)
+            self._server_sock = sock
+            self._running = True
+            _LOGGER.info(
+                "HA Bluetooth TCP tunnel listening on RFCOMM channel %d", self._channel
+            )
+        except OSError as exc:
+            _LOGGER.error("Failed to start RFCOMM TCP tunnel on channel %d: %s", self._channel, exc)
+            raise
+
+        self._accept_task = asyncio.ensure_future(self._accept_loop())
+
+    async def stop(self) -> None:
+        """Close the server socket and cancel the accept loop."""
+        self._running = False
+        if self._accept_task:
+            self._accept_task.cancel()
+        if self._server_sock:
+            self._server_sock.close()
+            self._server_sock = None
+        _LOGGER.info("HA Bluetooth TCP tunnel stopped")
+
+    async def _accept_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        while self._running and self._server_sock:
+            try:
+                client_sock, addr = await loop.sock_accept(self._server_sock)
+                _LOGGER.debug("TCP tunnel: RFCOMM connection from %s", addr)
+                asyncio.ensure_future(self._handle_client(client_sock))
+            except asyncio.CancelledError:
+                break
+            except OSError as exc:
+                if self._running:
+                    _LOGGER.error("TCP tunnel accept error: %s", exc)
+                break
+
+    async def _handle_client(self, rfcomm_sock: socket.socket) -> None:
+        """Relay bytes between one RFCOMM client and a fresh TCP connection to HA."""
+        ha_port: int = self._hass.config.api.port  # type: ignore[union-attr]
+        try:
+            rfcomm_reader, rfcomm_writer = await asyncio.open_connection(sock=rfcomm_sock)
+            ha_reader, ha_writer = await asyncio.open_connection("127.0.0.1", ha_port)
+            _LOGGER.debug("TCP tunnel: relaying RFCOMM ↔ localhost:%d", ha_port)
+            try:
+                await asyncio.gather(
+                    self._pipe(rfcomm_reader, ha_writer, "RFCOMM→HA"),
+                    self._pipe(ha_reader, rfcomm_writer, "HA→RFCOMM"),
+                )
+            finally:
+                ha_writer.close()
+                try:
+                    await ha_writer.wait_closed()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("TCP tunnel: client error: %s", exc)
+        finally:
+            rfcomm_sock.close()
+
+    @staticmethod
+    async def _pipe(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        label: str,
+    ) -> None:
+        """Copy all bytes from *reader* to *writer* until EOF or error."""
+        try:
+            while True:
+                chunk = await reader.read(65536)
+                if not chunk:
+                    break
+                writer.write(chunk)
+                await writer.drain()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("TCP tunnel pipe %s ended: %s", label, exc)
+        finally:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass

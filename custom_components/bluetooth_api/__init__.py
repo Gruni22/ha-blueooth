@@ -24,7 +24,7 @@ from homeassistant.core import HomeAssistant
 
 from .api import BluetoothApiConfigView
 from .const import CONF_BLE_ENABLED, CONF_RFCOMM_CHANNEL, CONF_RFCOMM_ENABLED, DOMAIN
-from .rfcomm_server import RfcommServer
+from .rfcomm_server import RfcommServer, RfcommTcpTunnel
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +53,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "check that no other process is using this channel and that "
                 "Bluetooth is available on this host",
                 rfcomm_channel,
+                exc,
+            )
+
+        # Always start the TCP tunnel alongside the WS relay so the Android
+        # WebView can reach HA's full HTTP/WebSocket API via Bluetooth.
+        tcp_tunnel = RfcommTcpTunnel(hass)
+        try:
+            await tcp_tunnel.start()
+            servers.append(tcp_tunnel)
+        except OSError as exc:
+            _LOGGER.warning(
+                "Failed to start RFCOMM TCP tunnel (channel 3): %s – "
+                "WebView will not work via Bluetooth without WiFi",
                 exc,
             )
 
