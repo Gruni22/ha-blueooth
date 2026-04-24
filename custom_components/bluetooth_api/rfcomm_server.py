@@ -727,9 +727,12 @@ class RfcommTcpTunnel:
                     "AutoConnect": Variant("b", False),
                     "RequireAuthentication": Variant("b", False),
                     "RequireAuthorization": Variant("b", False),
-                    # Explicit SDP record required for custom UUIDs — BlueZ only
-                    # auto-creates SDP entries for well-known profile UUIDs (e.g. SPP).
-                    "ServiceRecord": Variant("s", _TUNNEL_SDP_RECORD),
+                    # NOTE: We intentionally omit ServiceRecord here.
+                    # Including ServiceRecord causes BlueZ to skip automatic RFCOMM socket
+                    # setup, leaving the channel 3 listener inactive. Android falls back to
+                    # direct channel 3 connect via reflection (BluetoothTcpProxy.openRfcommSocket).
+                    # SDP-based discovery for the custom UUID can be added once the ServiceRecord
+                    # interaction with BlueZ's RFCOMM socket setup is understood.
                 },
             )
         except Exception as exc:  # noqa: BLE001
