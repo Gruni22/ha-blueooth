@@ -6,8 +6,8 @@ Falls back to sdptool + raw socket if D-Bus profile registration fails.
 
 Also provides RfcommTcpTunnel (channel 3): a raw TCP-over-RFCOMM bridge so that
 the Android WebView can reach HA's HTTP/WebSocket server without WiFi.  Android
-connects directly to channel 3 (no SDP lookup) and all bytes are relayed to
-localhost:8123.  No framing or protocol knowledge is needed on this channel.
+discovers the service via SDP UUID lookup (HA_TCP_TUNNEL_UUID) and all bytes
+are relayed to localhost:8123.  No framing or protocol knowledge is needed.
 """
 
 # NOTE: do NOT add "from __future__ import annotations" here.
@@ -552,31 +552,126 @@ class RfcommServer:
 # TCP tunnel (channel 3) – raw relay for WebView HTTP + WebSocket
 # ---------------------------------------------------------------------------
 
-#: RFCOMM channel the TCP tunnel listens on.  Android connects directly by
-#: channel number (no SDP lookup), so this value must match HA_TCP_TUNNEL_CHANNEL
-#: in the Android BluetoothTcpProxy class.
+#: Custom UUID for the TCP-over-RFCOMM tunnel service.
+#: Android uses SDP lookup on this UUID to find the channel; must match
+#: HA_TCP_TUNNEL_UUID in BluetoothTcpProxy.kt.
+HA_TCP_TUNNEL_UUID = "a10d4b1c-bf45-4c2a-9c32-4a8f7e3d1237"
+
+#: D-Bus object path for the tunnel's BlueZ profile.
+_TUNNEL_PROFILE_PATH = "/org/homeassistant/bluetooth_api/tcp_tunnel"
+
+#: RFCOMM channel the TCP tunnel is registered on.
 TCP_TUNNEL_CHANNEL: int = 3
-TCP_TUNNEL_BACKLOG: int = 10
 
 
 class RfcommTcpTunnel:
     """Raw TCP-over-RFCOMM bridge: pipes RFCOMM connections to localhost:8123.
 
-    Each RFCOMM client gets its own TCP connection to the local HA server.  No
-    framing or protocol knowledge is applied – bytes flow transparently in both
-    directions.  This allows the Android WebView to load the HA frontend and
+    Registers a BlueZ D-Bus profile so Android can discover the service via SDP.
+    Each RFCOMM client gets its own TCP connection to the local HA server.  Bytes
+    flow transparently, allowing the Android WebView to load the HA frontend and
     maintain its WebSocket connection via Bluetooth when WiFi is unavailable.
     """
 
     def __init__(self, hass: HomeAssistant, channel: int = TCP_TUNNEL_CHANNEL) -> None:
         self._hass = hass
         self._channel = channel
-        self._server_sock: socket.socket | None = None
-        self._accept_task: asyncio.Task | None = None
+        self._dbus_bus = None
         self._running = False
 
     async def start(self) -> None:
-        """Bind RFCOMM socket on the tunnel channel and start accepting."""
+        """Register BlueZ D-Bus profile and start accepting connections."""
+        if await self._start_dbus_profile():
+            self._running = True
+            _LOGGER.info(
+                "HA Bluetooth TCP tunnel ready via BlueZ D-Bus profile on channel %d",
+                self._channel,
+            )
+            return
+
+        # Fallback: raw socket (works without D-Bus but no SDP record)
+        _LOGGER.warning(
+            "TCP tunnel D-Bus profile registration failed – "
+            "falling back to raw RFCOMM socket (no SDP; Android must use direct channel %d)",
+            self._channel,
+        )
+        await self._start_raw_socket()
+
+    async def _start_dbus_profile(self) -> bool:
+        """Register SPP-variant profile via BlueZ ProfileManager1. Returns True on success."""
+        try:
+            from dbus_fast import BusType, Variant  # type: ignore[import]
+            from dbus_fast.aio import MessageBus    # type: ignore[import]
+            from dbus_fast.service import ServiceInterface, method as dbus_method  # type: ignore[import]
+        except ImportError:
+            return False
+
+        try:
+            bus = await MessageBus(bus_type=BusType.SYSTEM, negotiate_unix_fd=True).connect()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("TCP tunnel: cannot connect to D-Bus: %s", exc)
+            return False
+
+        server_ref = self
+
+        class _TunnelProfileInterface(ServiceInterface):
+            def __init__(self) -> None:
+                super().__init__("org.bluez.Profile1")
+
+            @dbus_method()
+            def Release(self) -> "":
+                _LOGGER.debug("TCP tunnel profile released by BlueZ")
+
+            @dbus_method()
+            def NewConnection(self, device: "o", fd: "h", fd_properties: "a{sv}") -> "":
+                _LOGGER.info("TCP tunnel: new RFCOMM connection from %s", device)
+                try:
+                    duped = os.dup(fd)
+                    client_sock = socket.socket(
+                        socket.AF_BLUETOOTH,
+                        socket.SOCK_STREAM,
+                        socket.BTPROTO_RFCOMM,  # type: ignore[attr-defined]
+                        fileno=duped,
+                    )
+                    asyncio.ensure_future(server_ref._handle_client(client_sock))
+                except Exception as exc2:  # noqa: BLE001
+                    _LOGGER.error("TCP tunnel: failed to wrap fd: %s", exc2)
+
+            @dbus_method()
+            def RequestDisconnection(self, device: "o") -> "":
+                pass
+
+        profile = _TunnelProfileInterface()
+        bus.export(_TUNNEL_PROFILE_PATH, profile)
+
+        try:
+            introspection = await bus.introspect("org.bluez", "/org/bluez")
+            proxy = bus.get_proxy_object("org.bluez", "/org/bluez", introspection)
+            manager = proxy.get_interface("org.bluez.ProfileManager1")
+            await manager.call_register_profile(
+                _TUNNEL_PROFILE_PATH,
+                HA_TCP_TUNNEL_UUID,
+                {
+                    "Name": Variant("s", "HA TCP Tunnel"),
+                    "Channel": Variant("q", self._channel),
+                    "AutoConnect": Variant("b", False),
+                    "RequireAuthentication": Variant("b", False),
+                    "RequireAuthorization": Variant("b", False),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("TCP tunnel D-Bus profile registration failed: %s", exc)
+            try:
+                bus.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+
+        self._dbus_bus = bus
+        return True
+
+    async def _start_raw_socket(self) -> None:
+        """Fallback: bind raw RFCOMM socket (no SDP, Android must use direct channel)."""
         try:
             sock = socket.socket(
                 socket.AF_BLUETOOTH,
@@ -585,27 +680,40 @@ class RfcommTcpTunnel:
             )
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("00:00:00:00:00:00", self._channel))
-            sock.listen(TCP_TUNNEL_BACKLOG)
+            sock.listen(10)
             sock.setblocking(False)
             self._server_sock = sock
             self._running = True
             _LOGGER.info(
-                "HA Bluetooth TCP tunnel listening on RFCOMM channel %d", self._channel
+                "HA Bluetooth TCP tunnel (raw socket) listening on RFCOMM channel %d",
+                self._channel,
             )
         except OSError as exc:
-            _LOGGER.error("Failed to start RFCOMM TCP tunnel on channel %d: %s", self._channel, exc)
+            _LOGGER.error("Failed to start TCP tunnel on channel %d: %s", self._channel, exc)
             raise
-
         self._accept_task = asyncio.ensure_future(self._accept_loop())
 
     async def stop(self) -> None:
-        """Close the server socket and cancel the accept loop."""
+        """Unregister profile and close all resources."""
         self._running = False
-        if self._accept_task:
+        if hasattr(self, "_accept_task") and self._accept_task:
             self._accept_task.cancel()
-        if self._server_sock:
+        if hasattr(self, "_server_sock") and self._server_sock:
             self._server_sock.close()
             self._server_sock = None
+        if self._dbus_bus:
+            try:
+                introspection = await self._dbus_bus.introspect("org.bluez", "/org/bluez")
+                proxy = self._dbus_bus.get_proxy_object("org.bluez", "/org/bluez", introspection)
+                manager = proxy.get_interface("org.bluez.ProfileManager1")
+                await manager.call_unregister_profile(_TUNNEL_PROFILE_PATH)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("TCP tunnel profile unregister: %s", exc)
+            try:
+                self._dbus_bus.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            self._dbus_bus = None
         _LOGGER.info("HA Bluetooth TCP tunnel stopped")
 
     async def _accept_loop(self) -> None:
