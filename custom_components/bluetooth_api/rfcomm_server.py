@@ -391,8 +391,10 @@ class RfcommServer:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             assert self._agent_proc.stdin  # noqa: S101
+            # Send agent registration; default-agent is sent reactively in _agent_read_loop
+            # once "Agent registered" is confirmed — avoids the race condition on reload
+            # where the old session hasn't released the agent slot yet.
             self._agent_proc.stdin.write(b"agent DisplayYesNo\n")
-            self._agent_proc.stdin.write(b"default-agent\n")
             await self._agent_proc.stdin.drain()
             asyncio.ensure_future(self._agent_read_loop())
             _LOGGER.debug("Bluetooth pairing agent started (DisplayYesNo)")
@@ -437,10 +439,14 @@ class RfcommServer:
                 line = raw_part.strip()
                 if not line:
                     continue
-                # Skip high-frequency BLE chatter to avoid flooding the HA log buffer.
+                # Skip high-frequency noise to avoid flooding the HA log buffer.
                 if ("CHG] Device" in line or "NEW] Device" in line or "DEL] Device" in line
                         or "RSSI" in line or "ManufacturerData" in line
                         or "discovering" in line.lower()
+                        # Controller UUID list changes — verbose at startup, not actionable.
+                        or ("Controller" in line and "UUIDs:" in line)
+                        # LE Audio / Bluetooth 5.2 service UUIDs (184x) — BLE audio noise.
+                        or any(u in line.lower() for u in ("0000184d", "00001845", "00001843", "00001844", "0000184f"))
                         or (len(line) > 3 and all(c in "0123456789abcdef . " for c in line.lower()))):
                     continue
 
@@ -495,6 +501,14 @@ class RfcommServer:
                         self._hass,
                         f"Bluetooth legacy pairing.\n\nEnter PIN **{pin.decode()}** on your Android device.",
                     )
+
+                elif "agent registered" in lower_line:
+                    # BlueZ confirmed our agent registration (may arrive late after reload
+                    # race condition where the old agent slot wasn't freed yet).
+                    # Now set it as the default so it handles all pairing requests.
+                    stdin.write(b"default-agent\n")
+                    await stdin.drain()
+                    _LOGGER.debug("Bluetooth agent registered — set as default-agent")
 
                 elif "auth failed" in lower_line or "authentication failed" in lower_line:
                     # Clear confirmed set so next attempt can retry.
@@ -662,21 +676,14 @@ class RfcommTcpTunnel:
         self._running = False
 
     async def start(self) -> None:
-        """Register BlueZ D-Bus profile and start accepting connections."""
-        if await self._start_dbus_profile():
-            self._running = True
-            _LOGGER.info(
-                "HA Bluetooth TCP tunnel ready via BlueZ D-Bus profile on channel %d",
-                self._channel,
-            )
-            return
+        """Start the TCP tunnel on a raw RFCOMM socket.
 
-        # Fallback: raw socket (works without D-Bus but no SDP record)
-        _LOGGER.warning(
-            "TCP tunnel D-Bus profile registration failed – "
-            "falling back to raw RFCOMM socket (no SDP; Android must use direct channel %d)",
-            self._channel,
-        )
+        We use a raw socket instead of a BlueZ D-Bus profile because Android connects
+        via createInsecureRfcommSocket(channel) (direct channel, no UUID), which is a raw
+        RFCOMM connection.  BlueZ's ProfileManager1 only triggers NewConnection for
+        UUID-negotiated connections — raw channel connects bypass the profile layer
+        entirely and require a socket that is listening on the channel directly.
+        """
         await self._start_raw_socket()
 
     async def _start_dbus_profile(self) -> bool:
