@@ -4,10 +4,10 @@ Uses the BlueZ ProfileManager1 D-Bus API (modern BlueZ ≥ 5.43, no --compat nee
 to register the SPP service record so Android can discover and connect via SDP.
 Falls back to sdptool + raw socket if D-Bus profile registration fails.
 
-Also provides RfcommTcpTunnel (channel 3): a raw TCP-over-RFCOMM bridge so that
-the Android WebView can reach HA's HTTP/WebSocket server without WiFi.  Android
-discovers the service via SDP UUID lookup (HA_TCP_TUNNEL_UUID) and all bytes
-are relayed to localhost:8123.  No framing or protocol knowledge is needed.
+Each incoming RFCOMM connection is auto-detected:
+- Raw HTTP request (WebView via BluetoothTcpProxy) → byte-for-byte TCP relay to localhost:8123
+- 4-byte length-prefix framing (BluetoothWebSocketCoreImpl) → HA WebSocket relay
+Both connection types share the same SPP channel 1 (UUID 0x1101).
 """
 
 # NOTE: do NOT add "from __future__ import annotations" here.
@@ -45,6 +45,21 @@ _PROFILE_PATH = "/org/homeassistant/bluetooth_api/spp"
 
 _HAS_BLUETOOTHCTL = shutil.which("bluetoothctl") is not None
 _HAS_SDPTOOL = shutil.which("sdptool") is not None
+
+# 3-byte prefixes that identify HTTP request methods.
+# Used to distinguish raw HTTP connections (WebView via BluetoothTcpProxy) from
+# the 4-byte length-prefix framing used by BluetoothWebSocketCoreImpl.
+# HTTP verbs start with capital ASCII letters (0x44–0x54); the framing protocol's
+# length prefix always starts with 0x00 for any payload < 16 MB.
+_HTTP_METHOD_PREFIXES: frozenset[bytes] = frozenset({
+    b"GET", b"POS", b"PUT", b"DEL", b"HEA", b"OPT", b"PAT", b"CON", b"TRA",
+})
+
+
+def _is_http_method(data: bytes) -> bool:
+    """Return True if *data*'s first 3 bytes match an HTTP method verb."""
+    return data[:3] in _HTTP_METHOD_PREFIXES
+
 
 # D-Bus path for our Bluetooth Agent1.
 _AGENT_PATH = "/org/homeassistant/bluetooth_api/agent"
@@ -805,18 +820,72 @@ class RfcommServer:
     # ------------------------------------------------------------------
 
     async def _handle_client(self, client_sock: socket.socket) -> None:
-        """Bridge one RFCOMM client to the local HA WebSocket API."""
+        """Route one RFCOMM client to HTTP relay or WebSocket bridge.
+
+        Reads the first 4 bytes to distinguish:
+        - Raw HTTP (WebView via BluetoothTcpProxy): relayed byte-for-byte to localhost:8123
+        - Framing protocol (BluetoothWebSocketCoreImpl): bridged to HA WebSocket API
+        """
         reader, writer = await asyncio.open_connection(sock=client_sock)
+        try:
+            first = await asyncio.wait_for(reader.readexactly(4), timeout=10.0)
+        except (asyncio.IncompleteReadError, TimeoutError):
+            writer.close()
+            return
 
+        if _is_http_method(first):
+            await self._relay_http(first, reader, writer)
+        else:
+            await self._relay_ws(first, reader, writer)
+
+    async def _relay_http(
+        self,
+        first: bytes,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Raw TCP relay: RFCOMM ↔ localhost:8123 (for WebView HTTP + WebSocket upgrade)."""
+        ha_port: int = self._hass.config.api.port  # type: ignore[union-attr]
+        _LOGGER.info("RFCOMM: HTTP relay → localhost:%d", ha_port)
+        try:
+            ha_reader, ha_writer = await asyncio.open_connection("127.0.0.1", ha_port)
+            ha_writer.write(first)
+            await ha_writer.drain()
+            try:
+                await asyncio.gather(
+                    self._pipe(reader, ha_writer, "RFCOMM→HA"),
+                    self._pipe(ha_reader, writer, "HA→RFCOMM"),
+                )
+            finally:
+                ha_writer.close()
+                try:
+                    await ha_writer.wait_closed()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("RFCOMM HTTP relay error: %s", exc)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _relay_ws(
+        self,
+        first: bytes,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Bridge framing-protocol client to the local HA WebSocket API."""
         ws_url = f"ws://127.0.0.1:{self._hass.config.api.port}/api/websocket"  # type: ignore[union-attr]
-        _LOGGER.info("RFCOMM: bridging client to %s", ws_url)
-
+        _LOGGER.info("RFCOMM: WS relay → %s", ws_url)
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(ws_url) as ws:
                     _LOGGER.debug("RFCOMM: local WS established, starting bridge")
                     await asyncio.gather(
-                        self._bt_to_ws(reader, ws),
+                        self._bt_to_ws_with_prefix(first, reader, ws),
                         self._ws_to_bt(ws, writer),
                     )
         except Exception as exc:  # noqa: BLE001
@@ -830,18 +899,42 @@ class RfcommServer:
                 pass
 
     @staticmethod
-    async def _bt_to_ws(
+    async def _bt_to_ws_with_prefix(
+        first: bytes,
         reader: asyncio.StreamReader,
         ws: aiohttp.ClientWebSocketResponse,
     ) -> None:
-        """Forward BT frames → local HA WebSocket."""
+        """Forward BT frames → WS; *first* is the already-consumed 4-byte length prefix."""
+        import struct as _struct
         try:
+            (length,) = _struct.unpack("!I", first)
+            if 0 < length <= 16 * 1024 * 1024:
+                payload = await reader.readexactly(length)
+                _LOGGER.debug("RFCOMM RX (%d bytes) → WS: %.200s", len(payload), payload.decode(errors="replace"))
+                await ws.send_str(payload.decode(errors="replace"))
             while True:
                 frame = await rfcomm_read_frame(reader)
                 _LOGGER.debug("RFCOMM RX (%d bytes) → WS: %.200s", len(frame), frame.decode(errors="replace"))
-                await ws.send_str(frame.decode())
+                await ws.send_str(frame.decode(errors="replace"))
         except asyncio.IncompleteReadError:
             _LOGGER.debug("RFCOMM: client disconnected (IncompleteReadError)")
+
+    @staticmethod
+    async def _pipe(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        label: str,
+    ) -> None:
+        """Copy bytes from *reader* to *writer* until EOF or error."""
+        try:
+            while True:
+                chunk = await reader.read(65536)
+                if not chunk:
+                    break
+                writer.write(chunk)
+                await writer.drain()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("RFCOMM pipe %s ended: %s", label, exc)
 
     async def _ws_to_bt(
         self,
@@ -876,295 +969,3 @@ class RfcommServer:
                 _LOGGER.debug("RFCOMM WS closed: type=%s", msg.type)
                 break
 
-
-# ---------------------------------------------------------------------------
-# TCP tunnel (channel 3) – raw relay for WebView HTTP + WebSocket
-# ---------------------------------------------------------------------------
-
-# UUID for the TCP-over-RFCOMM tunnel service.
-# We use OBEX Object Push (0x1105) — a well-known profile UUID that BlueZ
-# automatically creates an SDP record for when registered via ProfileManager1.
-# Custom UUIDs don't get auto-SDP records; providing ServiceRecord breaks the
-# RFCOMM socket setup. OBEX Push is unused on HAOS so there's no conflict.
-# Must match HA_TCP_TUNNEL_UUID in BluetoothTcpProxy.kt.
-HA_TCP_TUNNEL_UUID = "00001105-0000-1000-8000-00805f9b34fb"
-
-#: RFCOMM channel the TCP tunnel is registered on.
-TCP_TUNNEL_CHANNEL: int = 3
-
-#: D-Bus object path for the tunnel's BlueZ profile.
-_TUNNEL_PROFILE_PATH = "/org/homeassistant/bluetooth_api/tcp_tunnel"
-
-# BlueZ only auto-generates SDP records for well-known profile UUIDs (e.g. SPP 0x1101).
-# For custom UUIDs we must supply the SDP record explicitly so Android can discover
-# the RFCOMM channel via createInsecureRfcommSocketToServiceRecord(UUID).
-# Attribute IDs: 0x0001=ServiceClassIDList, 0x0004=ProtocolDescriptorList (L2CAP+RFCOMM ch3),
-#                0x0009=BluetoothProfileDescriptorList, 0x0100=ServiceName.
-_TUNNEL_SDP_RECORD = (
-    '<?xml version="1.0" encoding="UTF-8" ?>'
-    "<record>"
-    '<attribute id="0x0001">'
-    "<sequence>"
-    f'<uuid value="{HA_TCP_TUNNEL_UUID}"/>'
-    "</sequence>"
-    "</attribute>"
-    '<attribute id="0x0004">'
-    "<sequence>"
-    "<sequence>"
-    '<uuid value="0x0100"/>'
-    "</sequence>"
-    "<sequence>"
-    '<uuid value="0x0003"/>'
-    f'<uint8 value="{TCP_TUNNEL_CHANNEL}"/>'
-    "</sequence>"
-    "</sequence>"
-    "</attribute>"
-    '<attribute id="0x0009">'
-    "<sequence>"
-    "<sequence>"
-    f'<uuid value="{HA_TCP_TUNNEL_UUID}"/>'
-    '<uint16 value="0x0100"/>'
-    "</sequence>"
-    "</sequence>"
-    "</attribute>"
-    '<attribute id="0x0100">'
-    '<text value="HA TCP Tunnel"/>'
-    "</attribute>"
-    "</record>"
-)
-
-
-class RfcommTcpTunnel:
-    """Raw TCP-over-RFCOMM bridge: pipes RFCOMM connections to localhost:8123.
-
-    Registers a BlueZ D-Bus profile so Android can discover the service via SDP.
-    Each RFCOMM client gets its own TCP connection to the local HA server.  Bytes
-    flow transparently, allowing the Android WebView to load the HA frontend and
-    maintain its WebSocket connection via Bluetooth when WiFi is unavailable.
-    """
-
-    def __init__(self, hass: HomeAssistant, channel: int = TCP_TUNNEL_CHANNEL) -> None:
-        self._hass = hass
-        self._channel = channel
-        self._dbus_bus = None
-        self._running = False
-
-    async def start(self) -> None:
-        """Start the TCP tunnel.
-
-        Tries BlueZ D-Bus profile first (RequireAuthentication=False bypasses the
-        security level mismatch that causes insecure RFCOMM connects to fail).
-        Falls back to a raw RFCOMM socket if D-Bus is unavailable.
-
-        Both approaches handle Android's createInsecureRfcommSocket(channel=3) connects:
-        - D-Bus profile: BlueZ calls NewConnection for any connection on channel 3,
-          whether UUID-based (SDP) or direct-channel (no UUID).
-        - Raw socket fallback: explicit BT_SECURITY=0 + RFCOMM_LM=0 allow insecure connects.
-        """
-        if not await self._start_dbus_profile():
-            await self._start_raw_socket()
-
-    async def _start_dbus_profile(self) -> bool:
-        """Register SPP-variant profile via BlueZ ProfileManager1. Returns True on success."""
-        try:
-            from dbus_fast import BusType, Variant  # type: ignore[import]
-            from dbus_fast.aio import MessageBus    # type: ignore[import]
-            from dbus_fast.service import ServiceInterface, method as dbus_method  # type: ignore[import]
-        except ImportError:
-            return False
-
-        try:
-            bus = await MessageBus(bus_type=BusType.SYSTEM, negotiate_unix_fd=True).connect()
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.debug("TCP tunnel: cannot connect to D-Bus: %s", exc)
-            return False
-
-        server_ref = self
-
-        class _TunnelProfileInterface(ServiceInterface):
-            def __init__(self) -> None:
-                super().__init__("org.bluez.Profile1")
-
-            @dbus_method()
-            def Release(self) -> "":
-                _LOGGER.debug("TCP tunnel profile released by BlueZ")
-
-            @dbus_method()
-            def NewConnection(self, device: "o", fd: "h", fd_properties: "a{sv}") -> "":
-                _LOGGER.info("TCP tunnel: new RFCOMM connection from %s", device)
-                try:
-                    duped = os.dup(fd)
-                    client_sock = socket.socket(
-                        socket.AF_BLUETOOTH,
-                        socket.SOCK_STREAM,
-                        socket.BTPROTO_RFCOMM,  # type: ignore[attr-defined]
-                        fileno=duped,
-                    )
-                    asyncio.ensure_future(server_ref._handle_client(client_sock))
-                except Exception as exc2:  # noqa: BLE001
-                    _LOGGER.error("TCP tunnel: failed to wrap fd: %s", exc2)
-
-            @dbus_method()
-            def RequestDisconnection(self, device: "o") -> "":
-                pass
-
-        profile = _TunnelProfileInterface()
-        bus.export(_TUNNEL_PROFILE_PATH, profile)
-
-        try:
-            introspection = await bus.introspect("org.bluez", "/org/bluez")
-            proxy = bus.get_proxy_object("org.bluez", "/org/bluez", introspection)
-            manager = proxy.get_interface("org.bluez.ProfileManager1")
-            await manager.call_register_profile(
-                _TUNNEL_PROFILE_PATH,
-                HA_TCP_TUNNEL_UUID,
-                {
-                    "Name": Variant("s", "HA TCP Tunnel"),
-                    "Channel": Variant("q", self._channel),
-                    "AutoConnect": Variant("b", False),
-                    "RequireAuthentication": Variant("b", False),
-                    "RequireAuthorization": Variant("b", False),
-                    # NOTE: We intentionally omit ServiceRecord here.
-                    # Including ServiceRecord causes BlueZ to skip automatic RFCOMM socket
-                    # setup, leaving the channel 3 listener inactive. Android falls back to
-                    # direct channel 3 connect via reflection (BluetoothTcpProxy.openRfcommSocket).
-                    # SDP-based discovery for the custom UUID can be added once the ServiceRecord
-                    # interaction with BlueZ's RFCOMM socket setup is understood.
-                },
-            )
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("TCP tunnel D-Bus profile registration failed: %s", exc)
-            try:
-                bus.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-            return False
-
-        self._dbus_bus = bus
-        _LOGGER.info(
-            "HA Bluetooth TCP tunnel (D-Bus profile) ready on channel %d, UUID=%s",
-            self._channel, HA_TCP_TUNNEL_UUID,
-        )
-        return True
-
-    async def _start_raw_socket(self) -> None:
-        """Fallback: bind raw RFCOMM socket (no SDP, Android must use direct channel)."""
-        import struct as _struct
-        try:
-            sock = socket.socket(
-                socket.AF_BLUETOOTH,
-                socket.SOCK_STREAM,
-                socket.BTPROTO_RFCOMM,  # type: ignore[attr-defined]
-            )
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            # Allow insecure RFCOMM connections (Android's createInsecureRfcommSocket uses
-            # BT_SECURITY_SDP=0; without this, BlueZ rejects the connection before accept()).
-            # BT_SECURITY=4 at SOL_BLUETOOTH=274; struct bt_security { __u8 level, key_size }
-            try:
-                sock.setsockopt(274, 4, _struct.pack("BB", 0, 0))  # BT_SECURITY_SDP, key=0
-                _LOGGER.debug("TCP tunnel: set BT_SECURITY=SDP (insecure connections allowed)")
-            except OSError as e:
-                _LOGGER.debug("TCP tunnel: could not set BT_SECURITY: %s", e)
-            # RFCOMM_LM=0 at level BTPROTO_RFCOMM: clear all link-mode requirements.
-            try:
-                sock.setsockopt(socket.BTPROTO_RFCOMM, 0x03, 0)  # type: ignore[attr-defined]
-                _LOGGER.debug("TCP tunnel: set RFCOMM_LM=0 (no auth/encrypt requirement)")
-            except OSError as e:
-                _LOGGER.debug("TCP tunnel: could not set RFCOMM_LM: %s", e)
-            sock.bind(("00:00:00:00:00:00", self._channel))
-            sock.listen(10)
-            sock.setblocking(False)
-            self._server_sock = sock
-            self._running = True
-            _LOGGER.info(
-                "HA Bluetooth TCP tunnel (raw socket) listening on RFCOMM channel %d",
-                self._channel,
-            )
-        except OSError as exc:
-            _LOGGER.error("Failed to start TCP tunnel on channel %d: %s", self._channel, exc)
-            raise
-        self._accept_task = asyncio.ensure_future(self._accept_loop())
-
-    async def stop(self) -> None:
-        """Unregister profile and close all resources."""
-        self._running = False
-        if hasattr(self, "_accept_task") and self._accept_task:
-            self._accept_task.cancel()
-        if hasattr(self, "_server_sock") and self._server_sock:
-            self._server_sock.close()
-            self._server_sock = None
-        if self._dbus_bus:
-            try:
-                introspection = await self._dbus_bus.introspect("org.bluez", "/org/bluez")
-                proxy = self._dbus_bus.get_proxy_object("org.bluez", "/org/bluez", introspection)
-                manager = proxy.get_interface("org.bluez.ProfileManager1")
-                await manager.call_unregister_profile(_TUNNEL_PROFILE_PATH)
-            except Exception as exc:  # noqa: BLE001
-                _LOGGER.debug("TCP tunnel profile unregister: %s", exc)
-            try:
-                self._dbus_bus.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-            self._dbus_bus = None
-        _LOGGER.info("HA Bluetooth TCP tunnel stopped")
-
-    async def _accept_loop(self) -> None:
-        loop = asyncio.get_running_loop()
-        _LOGGER.debug("TCP tunnel: raw socket accept loop started on channel %d", self._channel)
-        while self._running and self._server_sock:
-            try:
-                client_sock, addr = await loop.sock_accept(self._server_sock)
-                _LOGGER.info("TCP tunnel: RFCOMM connection from %s", addr)
-                asyncio.ensure_future(self._handle_client(client_sock))
-            except asyncio.CancelledError:
-                break
-            except OSError as exc:
-                if self._running:
-                    _LOGGER.error("TCP tunnel accept error: %s", exc)
-                break
-        _LOGGER.debug("TCP tunnel: raw socket accept loop ended")
-
-    async def _handle_client(self, rfcomm_sock: socket.socket) -> None:
-        """Relay bytes between one RFCOMM client and a fresh TCP connection to HA."""
-        ha_port: int = self._hass.config.api.port  # type: ignore[union-attr]
-        try:
-            rfcomm_reader, rfcomm_writer = await asyncio.open_connection(sock=rfcomm_sock)
-            ha_reader, ha_writer = await asyncio.open_connection("127.0.0.1", ha_port)
-            _LOGGER.debug("TCP tunnel: relaying RFCOMM ↔ localhost:%d", ha_port)
-            try:
-                await asyncio.gather(
-                    self._pipe(rfcomm_reader, ha_writer, "RFCOMM→HA"),
-                    self._pipe(ha_reader, rfcomm_writer, "HA→RFCOMM"),
-                )
-            finally:
-                ha_writer.close()
-                try:
-                    await ha_writer.wait_closed()
-                except Exception:  # noqa: BLE001
-                    pass
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.debug("TCP tunnel: client error: %s", exc)
-        finally:
-            rfcomm_sock.close()
-
-    @staticmethod
-    async def _pipe(
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        label: str,
-    ) -> None:
-        """Copy all bytes from *reader* to *writer* until EOF or error."""
-        try:
-            while True:
-                chunk = await reader.read(65536)
-                if not chunk:
-                    break
-                writer.write(chunk)
-                await writer.drain()
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.debug("TCP tunnel pipe %s ended: %s", label, exc)
-        finally:
-            try:
-                writer.close()
-            except Exception:  # noqa: BLE001
-                pass
