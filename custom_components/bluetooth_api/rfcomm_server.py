@@ -162,7 +162,7 @@ class RfcommServer:
             return False
 
         try:
-            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            bus = await MessageBus(bus_type=BusType.SYSTEM, negotiate_unix_fd=True).connect()
         except Exception as exc:  # noqa: BLE001
             _LOGGER.debug("Cannot connect to system D-Bus: %s", exc)
             return False
@@ -410,10 +410,11 @@ class RfcommServer:
             line = _ANSI_RE.sub("", raw.decode(errors="replace")).strip()
             if not line:
                 continue
-            # Skip high-frequency BLE advertisement chatter — CHG/NEW/DEL Device lines
-            # fire dozens of times per second and would flood the HA log buffer.
+            # Skip high-frequency BLE chatter to avoid flooding the HA log buffer.
             if ("CHG] Device" in line or "NEW] Device" in line or "DEL] Device" in line
-                    or "RSSI" in line or "ManufacturerData" in line):
+                    or "RSSI" in line or "ManufacturerData" in line
+                    or "discovering" in line.lower()
+                    or (len(line) > 3 and all(c in "0123456789abcdef . " for c in line.lower()))):
                 continue
 
             _LOGGER.debug("bluetoothctl: %s", line)
