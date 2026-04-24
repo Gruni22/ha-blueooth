@@ -447,7 +447,16 @@ class RfcommServer:
                 _LOGGER.debug("bluetoothctl: %s", line)
                 lower_line = line.lower()
 
-                if (
+                if "authorize service" in lower_line:
+                    # Service-level authorization (e.g. OBEX, RFCOMM profile access).
+                    # "Authorize service" is the notification line that appears BEFORE the
+                    # no-newline "(yes/no):" agent prompt — respond early so the buffered
+                    # "yes" is consumed before Android's connection timeout fires.
+                    _LOGGER.debug("Bluetooth agent: authorizing service connection")
+                    stdin.write(b"yes\n")
+                    await stdin.drain()
+
+                elif (
                     "confirm passkey" in lower_line
                     or "confirm value" in lower_line
                     or ("authorize" in lower_line and "yes/no" in lower_line)
