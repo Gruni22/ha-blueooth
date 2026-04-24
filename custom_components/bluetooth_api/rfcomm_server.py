@@ -46,6 +46,31 @@ _PROFILE_PATH = "/org/homeassistant/bluetooth_api/spp"
 _HAS_BLUETOOTHCTL = shutil.which("bluetoothctl") is not None
 _HAS_SDPTOOL = shutil.which("sdptool") is not None
 
+# D-Bus path for our Bluetooth Agent1.
+_AGENT_PATH = "/org/homeassistant/bluetooth_api/agent"
+
+# Audio/media profile UUIDs that Android auto-connects for sound streaming.
+# We block these so the Pi does not appear as an audio device.
+_AUDIO_UUIDS: frozenset[str] = frozenset({
+    "0000110a-0000-1000-8000-00805f9b34fb",  # A2DP Source
+    "0000110b-0000-1000-8000-00805f9b34fb",  # A2DP Sink
+    "0000110c-0000-1000-8000-00805f9b34fb",  # AVRCP Target
+    "0000110d-0000-1000-8000-00805f9b34fb",  # A/V Remote Control (AVRCP)
+    "0000110e-0000-1000-8000-00805f9b34fb",  # AVRCP Controller
+    "00001111-0000-1000-8000-00805f9b34fb",  # Audio Video Rendering
+    "00001108-0000-1000-8000-00805f9b34fb",  # HSP Headset
+    "00001112-0000-1000-8000-00805f9b34fb",  # HSP Audio Gateway
+    "0000111e-0000-1000-8000-00805f9b34fb",  # HFP Hands-Free
+    "0000111f-0000-1000-8000-00805f9b34fb",  # HFP Audio Gateway
+    # LE Audio (Bluetooth 5.2+)
+    "0000184d-0000-1000-8000-00805f9b34fb",  # Published Audio Capabilities
+    "00001843-0000-1000-8000-00805f9b34fb",  # Basic Audio Announcement
+    "00001844-0000-1000-8000-00805f9b34fb",  # Broadcast Audio Announcement
+    "00001845-0000-1000-8000-00805f9b34fb",  # Common Audio Service
+    "0000184e-0000-1000-8000-00805f9b34fb",  # Hearing Access Service
+    "0000184f-0000-1000-8000-00805f9b34fb",  # Telephone Bearer Profile
+})
+
 
 def _async_create_notification(hass: HomeAssistant, message: str) -> None:
     """Create a persistent HA notification via the service bus."""
@@ -89,7 +114,9 @@ class RfcommServer:
         self._server_sock: socket.socket | None = None
         self._accept_task: asyncio.Task | None = None
 
-        # Shared state
+        # D-Bus Agent1 (primary — blocks audio UUIDs, auto-confirms pairing)
+        self._agent_bus = None         # dbus_fast MessageBus for Agent1
+        # Fallback pairing agent via bluetoothctl subprocess
         self._agent_proc: asyncio.subprocess.Process | None = None
 
     # ------------------------------------------------------------------
@@ -99,7 +126,10 @@ class RfcommServer:
     async def start(self) -> None:
         """Make adapter discoverable, register SPP, start accepting connections."""
         await self._set_discoverable(True)
-        await self._start_pairing_agent()
+        # Prefer the D-Bus Agent1 (precise UUID-based blocking of audio profiles).
+        # Fall back to the bluetoothctl subprocess agent if dbus_fast is unavailable.
+        if not await self._start_dbus_agent():
+            await self._start_pairing_agent()
 
         # Try modern D-Bus profile registration first.
         if await self._start_dbus_profile():
@@ -148,6 +178,7 @@ class RfcommServer:
                 self._server_sock.close()
                 self._server_sock = None
             await self._unregister_sdp()
+        await self._stop_dbus_agent()
         await self._stop_pairing_agent()
         await self._set_discoverable(False)
         _LOGGER.info("HA Bluetooth API (RFCOMM) stopped")
@@ -376,7 +407,235 @@ class RfcommServer:
         await self._run_cmd(["bluetoothctl", "pairable", flag])
 
     # ------------------------------------------------------------------
-    # Pairing agent
+    # D-Bus Agent1 (primary pairing + audio-blocking agent)
+    # ------------------------------------------------------------------
+
+    async def _start_dbus_agent(self) -> bool:
+        """Register a BlueZ Agent1 via D-Bus.
+
+        This agent:
+        - Blocks audio/media profiles (A2DP, AVRCP, HFP, HSP, LE Audio) so Android
+          does not stream phone audio to the Pi.
+        - Auto-confirms pairing requests (passkey shown in HA notification).
+
+        Returns True if the agent was registered successfully.
+        """
+        try:
+            from dbus_fast import BusType, DBusError as _DBusError  # type: ignore[import]
+            from dbus_fast.aio import MessageBus as _MessageBus  # type: ignore[import]
+            from dbus_fast.service import ServiceInterface, method as dbus_method  # type: ignore[import]
+        except ImportError:
+            _LOGGER.debug("dbus_fast not available – using bluetoothctl agent fallback")
+            return False
+
+        try:
+            bus = await _MessageBus(bus_type=BusType.SYSTEM).connect()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("D-Bus agent: cannot connect to system bus: %s", exc)
+            return False
+
+        hass_ref = self._hass
+
+        # Annotations below use dbus_fast D-Bus type codes as strings ("o"=object path,
+        # "s"=string, "u"=uint32, "q"=uint16, ""=void). Pylance flags them as unknown
+        # type names — that is expected; do NOT replace them with Python types.
+        class _Agent1(ServiceInterface):  # type: ignore[misc]
+            """BlueZ Agent1 implementation."""
+
+            def __init__(self) -> None:
+                super().__init__("org.bluez.Agent1")
+
+            @dbus_method()
+            def Release(self) -> "":  # type: ignore[return,misc]
+                _LOGGER.debug("BT agent: released by BlueZ")
+
+            @dbus_method()
+            def Cancel(self) -> "":  # type: ignore[return,misc]
+                _LOGGER.debug("BT agent: operation cancelled")
+
+            @dbus_method()
+            def AuthorizeService(self, device: "o", uuid: "s") -> "":  # type: ignore[misc]
+                uuid_lower = uuid.lower()
+                if uuid_lower in _AUDIO_UUIDS:
+                    _LOGGER.info(
+                        "BT agent: blocking audio service %s from %s "
+                        "(prevents phone audio streaming to Pi)",
+                        uuid, device,
+                    )
+                    raise _DBusError(
+                        "org.bluez.Error.Rejected",
+                        f"Audio profile {uuid} is disabled on this server",
+                    )
+                _LOGGER.debug("BT agent: authorizing service %s from %s", uuid, device)
+
+            @dbus_method()
+            def RequestAuthorization(self, device: "o") -> "":  # type: ignore[misc]
+                _LOGGER.debug("BT agent: authorizing device %s", device)
+
+            @dbus_method()
+            def RequestConfirmation(self, device: "o", passkey: "u") -> "":  # type: ignore[misc]
+                passkey_str = str(passkey).zfill(6)
+                _LOGGER.info(
+                    "BT pairing: confirm passkey %s for %s on your Android device",
+                    passkey_str, device,
+                )
+                _async_create_notification(
+                    hass_ref,
+                    f"Bluetooth pairing in progress.\n\n"
+                    f"Confirm passkey **{passkey_str}** on your Android device.",
+                )
+
+            @dbus_method()
+            def RequestPinCode(self, device: "o") -> "s":  # type: ignore[misc]
+                _LOGGER.info("BT agent: PIN code requested for %s", device)
+                return "000000"
+
+            @dbus_method()
+            def RequestPasskey(self, device: "o") -> "u":  # type: ignore[misc]
+                _LOGGER.info("BT agent: passkey requested for %s", device)
+                return 0
+
+            @dbus_method()
+            def DisplayPinCode(self, device: "o", pincode: "s") -> "":  # type: ignore[misc]
+                _LOGGER.info("BT agent: PIN code for %s is %s", device, pincode)
+
+            @dbus_method()
+            def DisplayPasskey(self, device: "o", passkey: "u", entered: "q") -> "":  # type: ignore[misc]
+                _LOGGER.info("BT agent: passkey for %s: %06d", device, passkey)
+
+        agent = _Agent1()
+        bus.export(_AGENT_PATH, agent)
+
+        try:
+            introspection = await bus.introspect("org.bluez", "/org/bluez")
+            proxy = bus.get_proxy_object("org.bluez", "/org/bluez", introspection)
+            agent_mgr = proxy.get_interface("org.bluez.AgentManager1")
+            # Unregister any stale agent from a previous integration load before registering.
+            try:
+                await agent_mgr.call_unregister_agent(_AGENT_PATH)
+                _LOGGER.debug("BT agent: unregistered stale previous agent")
+            except Exception:  # noqa: BLE001
+                pass  # Not registered yet — expected on first start.
+            await agent_mgr.call_register_agent(_AGENT_PATH, "DisplayYesNo")
+            await agent_mgr.call_request_default_agent(_AGENT_PATH)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("BT agent registration failed: %s – using bluetoothctl fallback", exc)
+            try:
+                bus.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+
+        self._agent_bus = bus
+        _LOGGER.info(
+            "BT D-Bus Agent1 registered (audio profiles blocked, pairing auto-confirmed)"
+        )
+        # Disconnect audio profiles that connected before our agent started, and
+        # mark all paired devices as trusted so raw RFCOMM connections are accepted.
+        asyncio.ensure_future(self._disconnect_audio_profiles())
+        asyncio.ensure_future(self._trust_paired_devices())
+        return True
+
+    async def _disconnect_audio_profiles(self) -> None:
+        """Walk all connected BT devices and disconnect audio profiles.
+
+        Called once after the agent registers to clean up any audio connections that
+        were established before our agent started (e.g. during HA restart window).
+        """
+        if not self._agent_bus:
+            return
+        try:
+            root_intro = await self._agent_bus.introspect("org.bluez", "/")
+            root_proxy = self._agent_bus.get_proxy_object("org.bluez", "/", root_intro)
+            om = root_proxy.get_interface("org.freedesktop.DBus.ObjectManager")
+            objects = await om.call_get_managed_objects()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("BT: could not enumerate BT objects: %s", exc)
+            return
+
+        for path, interfaces in objects.items():
+            if "org.bluez.Device1" not in interfaces:
+                continue
+            props = interfaces["org.bluez.Device1"]
+            # dbus_fast may return Variant or raw value depending on version.
+            def _unwrap(v: object) -> object:
+                return v.value if hasattr(v, "value") else v
+
+            if not _unwrap(props.get("Connected", False)):
+                continue
+
+            try:
+                dev_intro = await self._agent_bus.introspect("org.bluez", path)
+                dev_proxy = self._agent_bus.get_proxy_object("org.bluez", path, dev_intro)
+                dev_iface = dev_proxy.get_interface("org.bluez.Device1")
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("BT: cannot get device interface for %s: %s", path, exc)
+                continue
+
+            for uuid in _AUDIO_UUIDS:
+                try:
+                    await dev_iface.call_disconnect_profile(uuid)
+                    _LOGGER.info("BT: disconnected audio profile %s from %s", uuid, path)
+                except Exception:  # noqa: BLE001
+                    pass  # Profile not connected — expected for most UUIDs.
+
+    async def _trust_paired_devices(self) -> None:
+        """Mark all paired BT devices as Trusted so raw RFCOMM connections work.
+
+        BlueZ may reject raw RFCOMM connections (no UUID, no profile) from devices
+        that are Paired but not Trusted.  Setting Trusted=True removes this barrier.
+        """
+        if not self._agent_bus:
+            return
+        try:
+            from dbus_fast import Variant as _Variant  # type: ignore[import]
+            root_intro = await self._agent_bus.introspect("org.bluez", "/")
+            root_proxy = self._agent_bus.get_proxy_object("org.bluez", "/", root_intro)
+            om = root_proxy.get_interface("org.freedesktop.DBus.ObjectManager")
+            objects = await om.call_get_managed_objects()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("BT trust: could not enumerate devices: %s", exc)
+            return
+
+        def _unwrap(v: object) -> object:
+            return v.value if hasattr(v, "value") else v
+
+        for path, interfaces in objects.items():
+            if "org.bluez.Device1" not in interfaces:
+                continue
+            props = interfaces["org.bluez.Device1"]
+            if not _unwrap(props.get("Paired", False)):
+                continue
+            if _unwrap(props.get("Trusted", False)):
+                continue  # already trusted
+            try:
+                dev_intro = await self._agent_bus.introspect("org.bluez", path)
+                dev_proxy = self._agent_bus.get_proxy_object("org.bluez", path, dev_intro)
+                props_iface = dev_proxy.get_interface("org.freedesktop.DBus.Properties")
+                await props_iface.call_set("org.bluez.Device1", "Trusted", _Variant("b", True))
+                _LOGGER.info("BT trust: marked paired device %s as Trusted", path)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("BT trust: could not trust %s: %s", path, exc)
+
+    async def _stop_dbus_agent(self) -> None:
+        """Unregister the D-Bus Agent1."""
+        if not self._agent_bus:
+            return
+        try:
+            introspection = await self._agent_bus.introspect("org.bluez", "/org/bluez")
+            proxy = self._agent_bus.get_proxy_object("org.bluez", "/org/bluez", introspection)
+            agent_mgr = proxy.get_interface("org.bluez.AgentManager1")
+            await agent_mgr.call_unregister_agent(_AGENT_PATH)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("BT agent unregister: %s", exc)
+        try:
+            self._agent_bus.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        self._agent_bus = None
+
+    # ------------------------------------------------------------------
+    # Pairing agent (bluetoothctl subprocess fallback)
     # ------------------------------------------------------------------
 
     async def _start_pairing_agent(self) -> None:
@@ -454,12 +713,27 @@ class RfcommServer:
                 lower_line = line.lower()
 
                 if "authorize service" in lower_line:
-                    # Service-level authorization (e.g. OBEX, RFCOMM profile access).
-                    # "Authorize service" is the notification line that appears BEFORE the
-                    # no-newline "(yes/no):" agent prompt — respond early so the buffered
-                    # "yes" is consumed before Android's connection timeout fires.
-                    _LOGGER.debug("Bluetooth agent: authorizing service connection")
-                    stdin.write(b"yes\n")
+                    # "[agent] Authorize service <UUID> (yes/no):" — no trailing newline.
+                    # Extract the UUID and deny audio profiles; allow everything else.
+                    import re as _re
+                    _uuid_m = _re.search(
+                        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+                        lower_line,
+                    )
+                    _svc_uuid = _uuid_m.group(1) if _uuid_m else None
+                    if _svc_uuid and _svc_uuid in _AUDIO_UUIDS:
+                        _LOGGER.info(
+                            "Bluetooth agent: blocking audio service %s "
+                            "(prevents phone audio streaming to Pi)",
+                            _svc_uuid,
+                        )
+                        stdin.write(b"no\n")
+                    else:
+                        _LOGGER.debug(
+                            "Bluetooth agent: authorizing service %s",
+                            _svc_uuid or "(unknown)",
+                        )
+                        stdin.write(b"yes\n")
                     await stdin.drain()
 
                 elif (
@@ -676,15 +950,19 @@ class RfcommTcpTunnel:
         self._running = False
 
     async def start(self) -> None:
-        """Start the TCP tunnel on a raw RFCOMM socket.
+        """Start the TCP tunnel.
 
-        We use a raw socket instead of a BlueZ D-Bus profile because Android connects
-        via createInsecureRfcommSocket(channel) (direct channel, no UUID), which is a raw
-        RFCOMM connection.  BlueZ's ProfileManager1 only triggers NewConnection for
-        UUID-negotiated connections — raw channel connects bypass the profile layer
-        entirely and require a socket that is listening on the channel directly.
+        Tries BlueZ D-Bus profile first (RequireAuthentication=False bypasses the
+        security level mismatch that causes insecure RFCOMM connects to fail).
+        Falls back to a raw RFCOMM socket if D-Bus is unavailable.
+
+        Both approaches handle Android's createInsecureRfcommSocket(channel=3) connects:
+        - D-Bus profile: BlueZ calls NewConnection for any connection on channel 3,
+          whether UUID-based (SDP) or direct-channel (no UUID).
+        - Raw socket fallback: explicit BT_SECURITY=0 + RFCOMM_LM=0 allow insecure connects.
         """
-        await self._start_raw_socket()
+        if not await self._start_dbus_profile():
+            await self._start_raw_socket()
 
     async def _start_dbus_profile(self) -> bool:
         """Register SPP-variant profile via BlueZ ProfileManager1. Returns True on success."""
@@ -763,10 +1041,15 @@ class RfcommTcpTunnel:
             return False
 
         self._dbus_bus = bus
+        _LOGGER.info(
+            "HA Bluetooth TCP tunnel (D-Bus profile) ready on channel %d, UUID=%s",
+            self._channel, HA_TCP_TUNNEL_UUID,
+        )
         return True
 
     async def _start_raw_socket(self) -> None:
         """Fallback: bind raw RFCOMM socket (no SDP, Android must use direct channel)."""
+        import struct as _struct
         try:
             sock = socket.socket(
                 socket.AF_BLUETOOTH,
@@ -774,6 +1057,20 @@ class RfcommTcpTunnel:
                 socket.BTPROTO_RFCOMM,  # type: ignore[attr-defined]
             )
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Allow insecure RFCOMM connections (Android's createInsecureRfcommSocket uses
+            # BT_SECURITY_SDP=0; without this, BlueZ rejects the connection before accept()).
+            # BT_SECURITY=4 at SOL_BLUETOOTH=274; struct bt_security { __u8 level, key_size }
+            try:
+                sock.setsockopt(274, 4, _struct.pack("BB", 0, 0))  # BT_SECURITY_SDP, key=0
+                _LOGGER.debug("TCP tunnel: set BT_SECURITY=SDP (insecure connections allowed)")
+            except OSError as e:
+                _LOGGER.debug("TCP tunnel: could not set BT_SECURITY: %s", e)
+            # RFCOMM_LM=0 at level BTPROTO_RFCOMM: clear all link-mode requirements.
+            try:
+                sock.setsockopt(socket.BTPROTO_RFCOMM, 0x03, 0)  # type: ignore[attr-defined]
+                _LOGGER.debug("TCP tunnel: set RFCOMM_LM=0 (no auth/encrypt requirement)")
+            except OSError as e:
+                _LOGGER.debug("TCP tunnel: could not set RFCOMM_LM: %s", e)
             sock.bind(("00:00:00:00:00:00", self._channel))
             sock.listen(10)
             sock.setblocking(False)
@@ -813,10 +1110,11 @@ class RfcommTcpTunnel:
 
     async def _accept_loop(self) -> None:
         loop = asyncio.get_running_loop()
+        _LOGGER.debug("TCP tunnel: raw socket accept loop started on channel %d", self._channel)
         while self._running and self._server_sock:
             try:
                 client_sock, addr = await loop.sock_accept(self._server_sock)
-                _LOGGER.debug("TCP tunnel: RFCOMM connection from %s", addr)
+                _LOGGER.info("TCP tunnel: RFCOMM connection from %s", addr)
                 asyncio.ensure_future(self._handle_client(client_sock))
             except asyncio.CancelledError:
                 break
@@ -824,6 +1122,7 @@ class RfcommTcpTunnel:
                 if self._running:
                     _LOGGER.error("TCP tunnel accept error: %s", exc)
                 break
+        _LOGGER.debug("TCP tunnel: raw socket accept loop ended")
 
     async def _handle_client(self, rfcomm_sock: socket.socket) -> None:
         """Relay bytes between one RFCOMM client and a fresh TCP connection to HA."""
