@@ -557,11 +557,49 @@ class RfcommServer:
 #: HA_TCP_TUNNEL_UUID in BluetoothTcpProxy.kt.
 HA_TCP_TUNNEL_UUID = "a10d4b1c-bf45-4c2a-9c32-4a8f7e3d1237"
 
+#: RFCOMM channel the TCP tunnel is registered on.
+TCP_TUNNEL_CHANNEL: int = 3
+
 #: D-Bus object path for the tunnel's BlueZ profile.
 _TUNNEL_PROFILE_PATH = "/org/homeassistant/bluetooth_api/tcp_tunnel"
 
-#: RFCOMM channel the TCP tunnel is registered on.
-TCP_TUNNEL_CHANNEL: int = 3
+# BlueZ only auto-generates SDP records for well-known profile UUIDs (e.g. SPP 0x1101).
+# For custom UUIDs we must supply the SDP record explicitly so Android can discover
+# the RFCOMM channel via createInsecureRfcommSocketToServiceRecord(UUID).
+# Attribute IDs: 0x0001=ServiceClassIDList, 0x0004=ProtocolDescriptorList (L2CAP+RFCOMM ch3),
+#                0x0009=BluetoothProfileDescriptorList, 0x0100=ServiceName.
+_TUNNEL_SDP_RECORD = (
+    '<?xml version="1.0" encoding="UTF-8" ?>'
+    "<record>"
+    '<attribute id="0x0001">'
+    "<sequence>"
+    f'<uuid value="{HA_TCP_TUNNEL_UUID}"/>'
+    "</sequence>"
+    "</attribute>"
+    '<attribute id="0x0004">'
+    "<sequence>"
+    "<sequence>"
+    '<uuid value="0x0100"/>'
+    "</sequence>"
+    "<sequence>"
+    '<uuid value="0x0003"/>'
+    f'<uint8 value="{TCP_TUNNEL_CHANNEL}"/>'
+    "</sequence>"
+    "</sequence>"
+    "</attribute>"
+    '<attribute id="0x0009">'
+    "<sequence>"
+    "<sequence>"
+    f'<uuid value="{HA_TCP_TUNNEL_UUID}"/>'
+    '<uint16 value="0x0100"/>'
+    "</sequence>"
+    "</sequence>"
+    "</attribute>"
+    '<attribute id="0x0100">'
+    '<text value="HA TCP Tunnel"/>'
+    "</attribute>"
+    "</record>"
+)
 
 
 class RfcommTcpTunnel:
@@ -657,6 +695,9 @@ class RfcommTcpTunnel:
                     "AutoConnect": Variant("b", False),
                     "RequireAuthentication": Variant("b", False),
                     "RequireAuthorization": Variant("b", False),
+                    # Explicit SDP record required for custom UUIDs — BlueZ only
+                    # auto-creates SDP entries for well-known profile UUIDs (e.g. SPP).
+                    "ServiceRecord": Variant("s", _TUNNEL_SDP_RECORD),
                 },
             )
         except Exception as exc:  # noqa: BLE001
