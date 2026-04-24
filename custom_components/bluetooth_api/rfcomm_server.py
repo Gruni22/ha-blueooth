@@ -584,10 +584,13 @@ class RfcommServer:
 # TCP tunnel (channel 3) – raw relay for WebView HTTP + WebSocket
 # ---------------------------------------------------------------------------
 
-#: Custom UUID for the TCP-over-RFCOMM tunnel service.
-#: Android uses SDP lookup on this UUID to find the channel; must match
-#: HA_TCP_TUNNEL_UUID in BluetoothTcpProxy.kt.
-HA_TCP_TUNNEL_UUID = "a10d4b1c-bf45-4c2a-9c32-4a8f7e3d1237"
+# UUID for the TCP-over-RFCOMM tunnel service.
+# We use OBEX Object Push (0x1105) — a well-known profile UUID that BlueZ
+# automatically creates an SDP record for when registered via ProfileManager1.
+# Custom UUIDs don't get auto-SDP records; providing ServiceRecord breaks the
+# RFCOMM socket setup. OBEX Push is unused on HAOS so there's no conflict.
+# Must match HA_TCP_TUNNEL_UUID in BluetoothTcpProxy.kt.
+HA_TCP_TUNNEL_UUID = "00001105-0000-1000-8000-00805f9b34fb"
 
 #: RFCOMM channel the TCP tunnel is registered on.
 TCP_TUNNEL_CHANNEL: int = 3
