@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import subprocess
 from typing import TYPE_CHECKING
 
 import aiohttp
@@ -40,18 +39,15 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _find_hci_adapter() -> str:
-    """Return the first available hci adapter name, e.g. 'hci0'."""
+    """Return the first available hci adapter name, e.g. 'hci0'.
+
+    Uses sysfs instead of subprocess.run() to avoid blocking the event loop.
+    """
+    import pathlib
     try:
-        result = subprocess.run(
-            ["hciconfig"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        for line in result.stdout.splitlines():
-            if line and not line.startswith(" ") and ":" in line:
-                return line.split(":")[0].strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        for hci in sorted(pathlib.Path("/sys/class/bluetooth").glob("hci*")):
+            return hci.name  # e.g. "hci0"
+    except OSError:
         pass
     return "hci0"
 

@@ -400,7 +400,13 @@ class RfcommServer:
             _LOGGER.debug("Could not start pairing agent: %s", exc)
 
     async def _agent_read_loop(self) -> None:
-        """Read bluetoothctl output and auto-confirm pairing requests."""
+        """Read bluetoothctl output and auto-confirm pairing requests.
+
+        IMPORTANT: use read() not readline(). The  `[agent] Confirm passkey (yes/no): `
+        prompt has NO trailing newline, so readline() blocks until Android's pairing
+        timeout fires (~30 s) — by which time auth already failed. read() returns
+        as soon as any bytes arrive, so we always process output promptly.
+        """
         proc = self._agent_proc
         if not proc or not proc.stdout or not proc.stdin:
             return
@@ -408,56 +414,82 @@ class RfcommServer:
         stdin = proc.stdin
         import re
         _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+        _confirmed_passkeys: set[str] = set()
+        _buf = b""
 
-        async for raw in stdout:
-            if self._agent_proc is None:
+        while self._agent_proc is not None:
+            try:
+                chunk = await asyncio.wait_for(stdout.read(4096), timeout=30.0)
+            except TimeoutError:
+                continue
+            if not chunk:
                 break
-            line = _ANSI_RE.sub("", raw.decode(errors="replace")).strip()
-            if not line:
-                continue
-            # Skip high-frequency BLE chatter to avoid flooding the HA log buffer.
-            if ("CHG] Device" in line or "NEW] Device" in line or "DEL] Device" in line
-                    or "RSSI" in line or "ManufacturerData" in line
-                    or "discovering" in line.lower()
-                    or (len(line) > 3 and all(c in "0123456789abcdef . " for c in line.lower()))):
-                continue
+            _buf += chunk
+            # Split on newlines but also check tail for no-newline prompt pattern.
+            text = _ANSI_RE.sub("", _buf.decode(errors="replace"))
+            # Process each logical chunk separated by newlines, preserving incomplete tail.
+            parts = text.split("\n")
+            _buf = parts[-1].encode()  # keep incomplete tail for next iteration
+            # Also check if the tail itself contains an agent prompt (no newline).
+            check_parts = parts[:-1] + ([parts[-1]] if parts[-1].strip() else [])
 
-            _LOGGER.debug("bluetoothctl: %s", line)
+            for raw_part in check_parts:
+                line = raw_part.strip()
+                if not line:
+                    continue
+                # Skip high-frequency BLE chatter to avoid flooding the HA log buffer.
+                if ("CHG] Device" in line or "NEW] Device" in line or "DEL] Device" in line
+                        or "RSSI" in line or "ManufacturerData" in line
+                        or "discovering" in line.lower()
+                        or (len(line) > 3 and all(c in "0123456789abcdef . " for c in line.lower()))):
+                    continue
 
-            lower_line = line.lower()
-            if (
-                "confirm passkey" in lower_line
-                or "confirm value" in lower_line
-                or ("authorize" in lower_line and "yes/no" in lower_line)
-            ):
-                parts = line.split()
-                passkey = next(
-                    (p for p in parts if p.isdigit() and len(p) in (4, 6)), "??????"
-                )
-                _LOGGER.info(
-                    "Bluetooth pairing – confirm passkey %s on your Android device",
-                    passkey,
-                )
-                stdin.write(b"yes\n")
-                await stdin.drain()
-                _async_create_notification(
-                    self._hass,
-                    f"Bluetooth pairing in progress.\n\n"
-                    f"Confirm passkey **{passkey}** on your Android device.",
-                )
+                _LOGGER.debug("bluetoothctl: %s", line)
+                lower_line = line.lower()
 
-            elif "request pin" in lower_line or "request passkey" in lower_line:
-                pin = b"000000"
-                _LOGGER.info(
-                    "Bluetooth legacy pairing – enter PIN %s on your Android device",
-                    pin.decode(),
-                )
-                stdin.write(pin + b"\n")
-                await stdin.drain()
-                _async_create_notification(
-                    self._hass,
-                    f"Bluetooth legacy pairing.\n\nEnter PIN **{pin.decode()}** on your Android device.",
-                )
+                if (
+                    "confirm passkey" in lower_line
+                    or "confirm value" in lower_line
+                    or ("authorize" in lower_line and "yes/no" in lower_line)
+                    # "Request confirmation" appears BEFORE the (no-newline) agent prompt;
+                    # respond here so the pre-buffered "yes" is consumed immediately by
+                    # bluetoothctl's stdin read — before Android's pairing timeout fires.
+                    or "request confirmation" in lower_line
+                ):
+                    parts2 = line.split()
+                    passkey = next(
+                        (p for p in parts2 if p.isdigit() and len(p) in (4, 6)), "??????"
+                    )
+                    if passkey not in _confirmed_passkeys:
+                        _confirmed_passkeys.add(passkey)
+                        _LOGGER.info(
+                            "Bluetooth pairing – confirm passkey %s on your Android device",
+                            passkey,
+                        )
+                        stdin.write(b"yes\n")
+                        await stdin.drain()
+                        _async_create_notification(
+                            self._hass,
+                            f"Bluetooth pairing in progress.\n\n"
+                            f"Confirm passkey **{passkey}** on your Android device.",
+                        )
+
+                elif "request pin" in lower_line or "request passkey" in lower_line:
+                    pin = b"000000"
+                    _LOGGER.info(
+                        "Bluetooth legacy pairing – enter PIN %s on your Android device",
+                        pin.decode(),
+                    )
+                    stdin.write(pin + b"\n")
+                    await stdin.drain()
+                    _async_create_notification(
+                        self._hass,
+                        f"Bluetooth legacy pairing.\n\nEnter PIN **{pin.decode()}** on your Android device.",
+                    )
+
+                elif "auth failed" in lower_line or "authentication failed" in lower_line:
+                    # Clear confirmed set so next attempt can retry.
+                    _confirmed_passkeys.clear()
 
     async def _stop_pairing_agent(self) -> None:
         """Terminate the bluetoothctl pairing agent subprocess."""
